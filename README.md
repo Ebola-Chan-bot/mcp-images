@@ -1,5 +1,5 @@
 # MCP Server - Image
-A Model Context Protocol (MCP) server that provides tools for fetching and processing images from URLs, local file paths, and numpy arrays. The server includes a tool called fetch_images that returns images as base64-encoded strings along with their MIME types.
+A Model Context Protocol (MCP) server that provides tools for fetching and processing images from URLs, local file paths (including SVG files). The server includes a tool called fetch_images that returns images in a format suitable for LLMs.
 
 ## Support Us
 
@@ -25,6 +25,7 @@ Your contributions go a long way in fueling our passion for creating intelligent
 ## Features
 - Fetch images from URLs (http/https)
 - Load images from local file paths
+- **SVG support** — automatically converts SVG files to PNG via `svglib` + `reportlab`, with configurable DPI
 - Specialized handling for large local images
 - Automatic image compression for large images (>1MB)
 - Parallel processing of multiple images
@@ -32,20 +33,23 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - Comprehensive error handling and logging
 ## Prerequisites
 - Python 3.10+
-- uv package manager (recommended)
 ## Installation
 1. Clone this repository
-2. Create and activate a virtual environment using uv:
+2. Install dependencies using one of the following methods:
+
+### Option A: Using uv (with virtual environment)
+`uv run` will automatically create a virtual environment and install everything from `pyproject.toml`:
 ```bash
-uv venv
-# On Windows:
-.venv\Scripts\activate
-# On Unix/MacOS:
-source .venv/bin/activate
+uv run python mcp_image.py
 ```
-3. Install dependencies using uv:
+
+### Option B: Using pip (user-level, no virtual environment)
 ```bash
-uv pip install -r requirements.txt
+pip install httpx "mcp[cli]" pillow pycairo reportlab rlpycairo svglib
+```
+Then run directly with system Python:
+```bash
+python mcp_image.py
 ```
 ## Running the Server
 There are two ways to run the MCP server:
@@ -54,7 +58,11 @@ There are two ways to run the MCP server:
 To start the MCP server directly:
 
 ```bash
+# With uv (auto venv):
 uv run python mcp_image.py
+
+# Or with user-level pip:
+python mcp_image.py
 ```
 ### 2. Configure for Windsurf/Cursor
 #### Windsurf
@@ -67,7 +75,7 @@ To add this MCP server to Windsurf:
   "mcpServers": {
     "image": {
       "command": "uv",
-        "args": ["--directory", "/path/to/mcp-image", "run", "mcp_image.py"]
+      "args": ["--directory", "/path/to/mcp-image", "run", "mcp_image.py"]
     }
   }
 }
@@ -89,15 +97,44 @@ To add this MCP server to Cursor:
   }
 }
 ```
+#### VS Code
+Add to your user or workspace `mcp.json` (settings):
+```json
+// Using uv (auto venv):
+{
+  "servers": {
+    "image-service": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/mcp-image", "python", "mcp_image.py"]
+    }
+  }
+}
+
+// Or using system Python (user-level pip):
+{
+  "servers": {
+    "image-service": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["/path/to/mcp-image/mcp_image.py"],
+      "env": { "PYTHONUNBUFFERED": "1" }
+    }
+  }
+}
+```
 
 ## Available Tools
 The server provides the following tools:
 
-[fetch_images](mcp_image.py#L318): Fetch and process images from URLs or local file paths
+**fetch_images**: Fetch and process images from URLs or local file paths
+
 Parameters:
-image_sources: List of URLs or file paths to images
+- `image_sources` (required): List of URLs or file paths to images (including `.svg` files)
+- `svg_dpi` (optional, default: `150`): DPI for SVG to PNG conversion. Higher values produce clearer images but larger files.
+
 Returns:
-List of processed images with base64 encoding and MIME types
+- List of processed Image objects suitable for LLM consumption
 
 ### Usage Examples
 You can now use commands like:

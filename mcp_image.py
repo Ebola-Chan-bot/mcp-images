@@ -11,6 +11,8 @@ from PIL import Image as PILImage
 from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP, Image, Context
 from typing import List, Dict, Any, Union, Optional
+from svglib.svglib import svg2rlg
+from reportlab.graphics import renderPM
 
 MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
 TEMP_DIR = "./Temp"
@@ -159,7 +161,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
         logger.exception(f"Unexpected error processing {image_source}")
         return None
 
-async def process_local_image(file_path: str, ctx: Context) -> Dict[str, Any]:
+async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) -> Dict[str, Any]:
     """Processes a local image file and returns a dictionary with the result."""
     try:
         if not os.path.exists(file_path):
@@ -172,6 +174,30 @@ async def process_local_image(file_path: str, ctx: Context) -> Dict[str, Any]:
         _, ext = os.path.splitext(file_path)
         ext = ext[1:].lower() if ext else "jpeg"  # Default to jpeg if no extension
         
+        # Handle SVG files by converting to PNG first
+        if ext == "svg":
+            logger.debug(f"SVG file detected: {file_path}, converting to PNG")
+            try:
+                drawing = svg2rlg(file_path)
+                if drawing is None:
+                    error_msg = f"Failed to parse SVG file: {file_path}"
+                    ctx.error(error_msg)
+                    logger.error(error_msg)
+                    return {"path": file_path, "error": error_msg}
+                buf = BytesIO()
+                renderPM.drawToFile(drawing, buf, fmt="PNG", dpi=svg_dpi)
+                png_data = buf.getvalue()
+                logger.debug(f"Converted SVG to PNG: {len(png_data)} bytes")
+                processed_image = await process_image_data(png_data, "png", file_path, ctx)
+                if processed_image is None:
+                    return {"path": file_path, "error": "Failed to process SVG image"}
+                return {"path": file_path, "image": processed_image}
+            except Exception as e:
+                error_msg = f"Error converting SVG {file_path}: {str(e)}"
+                ctx.error(error_msg)
+                logger.exception(error_msg)
+                return {"path": file_path, "error": error_msg}
+
         # Map extension to proper MIME type
         mime_type_map = {
             "jpg": "jpeg",
@@ -353,7 +379,7 @@ def is_url(path_or_url: str) -> bool:
     parsed = urlparse(path_or_url)
     return bool(parsed.scheme and parsed.netloc)
 
-async def process_images_async(image_sources: List[str], ctx: Context) -> List[Dict[str, Any]]:
+async def process_images_async(image_sources: List[str], ctx: Context, svg_dpi: int = 150) -> List[Dict[str, Any]]:
     """Process multiple images (URLs or local files) concurrently."""
     if not image_sources:
         raise ValueError("No image sources provided")
@@ -375,7 +401,7 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     # Process local files if any
     if local_paths:
         logger.debug(f"Processing {len(local_paths)} local files")
-        local_tasks = [process_local_image(path, ctx) for path in local_paths]
+        local_tasks = [process_local_image(path, ctx, svg_dpi=svg_dpi) for path in local_paths]
         local_results = await asyncio.gather(*local_tasks)
         results.extend(local_results)
     
@@ -390,7 +416,7 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     return ordered_results
 
 @mcp.tool()
-async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | None]:
+async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 150):
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
     
@@ -404,6 +430,7 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | N
     
     Args:
         image_sources: A list of image URLs or local file paths. For a single image, provide a one-element list.
+        svg_dpi: DPI for SVG to PNG conversion. Higher values produce clearer images but larger files. Default: 150.
         
     Returns:
         A list of Image objects or None values (if processing failed) in the same order as the input sources.
@@ -423,7 +450,7 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | N
         logger.debug(f"Processing {len(image_sources)} image sources: {url_count} URLs and {local_count} local files")
         
         # Process all images
-        results = await process_images_async(image_sources, ctx)
+        results = await process_images_async(image_sources, ctx, svg_dpi=svg_dpi)
         
         # Extract just the Image objects or None values
         image_results = []
