@@ -11,8 +11,19 @@ from PIL import Image as PILImage
 from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP, Image, Context
 from typing import List, Dict, Any, Union, Optional
-from svglib.svglib import svg2rlg
-from reportlab.graphics import renderPM
+
+# Ensure Cairo DLL is findable on Windows
+if sys.platform == "win32":
+    _cairo_dll_dirs = [
+        r"C:\Program Files\Tesseract-OCR",
+        r"C:\Program Files (x86)\Balabolka\utils",
+    ]
+    for _d in _cairo_dll_dirs:
+        if os.path.isdir(_d):
+            os.add_dll_directory(_d)
+            break
+
+import cairosvg
 
 MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
 TEMP_DIR = "./Temp"
@@ -178,15 +189,9 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
         if ext == "svg":
             logger.debug(f"SVG file detected: {file_path}, converting to PNG")
             try:
-                drawing = svg2rlg(file_path)
-                if drawing is None:
-                    error_msg = f"Failed to parse SVG file: {file_path}"
-                    ctx.error(error_msg)
-                    logger.error(error_msg)
-                    return {"path": file_path, "error": error_msg}
-                buf = BytesIO()
-                renderPM.drawToFile(drawing, buf, fmt="PNG", dpi=svg_dpi)
-                png_data = buf.getvalue()
+                with open(file_path, "rb") as f:
+                    svg_data = f.read()
+                png_data = cairosvg.svg2png(bytestring=svg_data, dpi=svg_dpi)
                 logger.debug(f"Converted SVG to PNG: {len(png_data)} bytes")
                 processed_image = await process_image_data(png_data, "png", file_path, ctx)
                 if processed_image is None:
