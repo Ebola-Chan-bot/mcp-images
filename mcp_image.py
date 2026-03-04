@@ -438,7 +438,8 @@ async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 15
         svg_dpi: DPI for SVG to PNG conversion. Higher values produce clearer images but larger files. Default: 150.
         
     Returns:
-        A list of Image objects or None values (if processing failed) in the same order as the input sources.
+        A list in the same order as the input sources.
+        Each item is either an Image object (success) or an error string (failure).
     """
     try:
         start_time = asyncio.get_event_loop().time()
@@ -457,16 +458,20 @@ async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 15
         # Process all images
         results = await process_images_async(image_sources, ctx, svg_dpi=svg_dpi)
         
-        # Extract just the Image objects or None values
+        # Extract Image objects, or explicit error messages for failures
         image_results = []
         for result in results:
             if "image" in result:
                 image_results.append(result["image"])
             else:
-                image_results.append(None)
+                source = result.get("path") or result.get("url") or "unknown source"
+                error = result.get("error") or "Unknown error"
+                error_message = f"Error processing {source}: {error}"
+                ctx.error(error_message)
+                image_results.append(error_message)
         
         elapsed = asyncio.get_event_loop().time() - start_time
-        success_count = sum(1 for r in image_results if r is not None)
+        success_count = sum(1 for r in image_results if isinstance(r, Image))
         
         logger.debug(
             f"Processed {len(image_sources)} images in {elapsed:.2f} seconds. "
@@ -477,7 +482,7 @@ async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 15
     except Exception as e:
         logger.exception("Error in fetch_images")
         ctx.error(f"Failed to process images: {str(e)}")
-        return [None] * len(image_sources)
+        return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
 if __name__ == "__main__":
     mcp.run(transport='stdio')
