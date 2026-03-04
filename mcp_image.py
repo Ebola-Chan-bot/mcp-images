@@ -421,7 +421,11 @@ async def process_images_async(image_sources: List[str], ctx: Context, svg_dpi: 
     return ordered_results
 
 @mcp.tool()
-async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 150) -> List[Image | str]:
+# Note: Do not add return type annotation `-> List[Image | str]` to this tool function.
+# FastMCP uses Pydantic to inspect return types and generate JSON schemas for the MCP protocol.
+# Since `Image` is an arbitrary type and does not have `__get_pydantic_core_schema__` implemented,
+# adding a type hint like `List[Image]` will crash the server at startup with a PydanticSchemaGenerationError.
+async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 150):
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
     
@@ -486,5 +490,8 @@ async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 15
         ctx.error(f"Failed to process images: {str(e)}")
         return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
-if __name__ == "__main__":
+def main():
     mcp.run(transport='stdio')
+
+if __name__ == "__main__":
+    main()
