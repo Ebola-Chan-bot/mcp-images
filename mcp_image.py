@@ -2,6 +2,7 @@
 
 import os
 import sys
+import re
 import asyncio
 import httpx
 import logging
@@ -191,7 +192,15 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
             try:
                 with open(file_path, "rb") as f:
                     svg_data = f.read()
-                png_data = cairosvg.svg2png(bytestring=svg_data, dpi=svg_dpi)
+                    
+                # Add font fallbacks to prevent missing CJK/Emoji characters (squares/misrendering) in Cairo on Windows.
+                # Emoji/CJK fonts MUST come first so Cairo picks them before Arial for special glyphs.
+                text_data = svg_data.decode("utf-8", errors="ignore")
+                fallback = r"font-family: 'Segoe UI Emoji', 'Microsoft YaHei', 'PingFang SC', \1"
+                text_data = re.sub(r"font-family:([^;\"'\>\<\}]+)", fallback, text_data)
+                svg_data_with_fonts = text_data.encode("utf-8")
+
+                png_data = cairosvg.svg2png(bytestring=svg_data_with_fonts, dpi=svg_dpi)
                 logger.debug(f"Converted SVG to PNG: {len(png_data)} bytes")
                 processed_image = await process_image_data(png_data, "png", file_path, ctx)
                 if processed_image is None:
