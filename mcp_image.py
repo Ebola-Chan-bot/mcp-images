@@ -12,6 +12,19 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP, Image, Context
 from typing import List, Dict, Any, Union, Optional
 
+# Ensure Cairo DLL is findable on Windows
+if sys.platform == "win32":
+    _cairo_dll_dirs = [
+        r"C:\Program Files\Tesseract-OCR",
+        r"C:\Program Files (x86)\Balabolka\utils",
+    ]
+    for _d in _cairo_dll_dirs:
+        if os.path.isdir(_d):
+            os.add_dll_directory(_d)
+            break
+
+import cairosvg
+
 MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
 TEMP_DIR = "./Temp"
 DATA_DIR = "./data"
@@ -159,7 +172,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
         logger.exception(f"Unexpected error processing {image_source}")
         return None
 
-async def process_local_image(file_path: str, ctx: Context) -> Dict[str, Any]:
+async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) -> Dict[str, Any]:
     """Processes a local image file and returns a dictionary with the result."""
     try:
         if not os.path.exists(file_path):
@@ -172,6 +185,24 @@ async def process_local_image(file_path: str, ctx: Context) -> Dict[str, Any]:
         _, ext = os.path.splitext(file_path)
         ext = ext[1:].lower() if ext else "jpeg"  # Default to jpeg if no extension
         
+        # Handle SVG files by converting to PNG first
+        if ext == "svg":
+            logger.debug(f"SVG file detected: {file_path}, converting to PNG")
+            try:
+                with open(file_path, "rb") as f:
+                    svg_data = f.read()
+                png_data = cairosvg.svg2png(bytestring=svg_data, dpi=svg_dpi)
+                logger.debug(f"Converted SVG to PNG: {len(png_data)} bytes")
+                processed_image = await process_image_data(png_data, "png", file_path, ctx)
+                if processed_image is None:
+                    return {"path": file_path, "error": "Failed to process SVG image"}
+                return {"path": file_path, "image": processed_image}
+            except Exception as e:
+                error_msg = f"Error converting SVG {file_path}: {str(e)}"
+                ctx.error(error_msg)
+                logger.exception(error_msg)
+                return {"path": file_path, "error": error_msg}
+
         # Map extension to proper MIME type
         mime_type_map = {
             "jpg": "jpeg",
@@ -353,7 +384,7 @@ def is_url(path_or_url: str) -> bool:
     parsed = urlparse(path_or_url)
     return bool(parsed.scheme and parsed.netloc)
 
-async def process_images_async(image_sources: List[str], ctx: Context) -> List[Dict[str, Any]]:
+async def process_images_async(image_sources: List[str], ctx: Context, svg_dpi: int = 150) -> List[Dict[str, Any]]:
     """Process multiple images (URLs or local files) concurrently."""
     if not image_sources:
         raise ValueError("No image sources provided")
@@ -375,7 +406,7 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     # Process local files if any
     if local_paths:
         logger.debug(f"Processing {len(local_paths)} local files")
-        local_tasks = [process_local_image(path, ctx) for path in local_paths]
+        local_tasks = [process_local_image(path, ctx, svg_dpi=svg_dpi) for path in local_paths]
         local_results = await asyncio.gather(*local_tasks)
         results.extend(local_results)
     
@@ -390,7 +421,7 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     return ordered_results
 
 @mcp.tool()
-async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | str]:
+async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 150) -> List[Image | str]:
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
     
@@ -404,9 +435,11 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | s
     
     Args:
         image_sources: A list of image URLs or local file paths. For a single image, provide a one-element list.
+        svg_dpi: DPI for SVG to PNG conversion. Higher values produce clearer images but larger files. Default: 150.
         
     Returns:
-        A list of Image objects or error message strings in the same order as the input sources.
+        A list in the same order as the input sources.
+        Each item is either an Image object (success) or an error string (failure).
     """
     try:
         start_time = asyncio.get_event_loop().time()
@@ -423,9 +456,9 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | s
         logger.debug(f"Processing {len(image_sources)} image sources: {url_count} URLs and {local_count} local files")
         
         # Process all images
-        results = await process_images_async(image_sources, ctx)
+        results = await process_images_async(image_sources, ctx, svg_dpi=svg_dpi)
         
-        # Extract Image objects or error messages
+        # Extract Image objects, or explicit error messages for failures
         image_results = []
         for result in results:
             if "image" in result:
@@ -433,7 +466,11 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | s
             elif "error" in result:
                 image_results.append(result["error"])
             else:
-                image_results.append("Unknown error processing image")
+                source = result.get("path") or result.get("url") or "unknown source"
+                error = result.get("error") or "Unknown error"
+                error_message = f"Error processing {source}: {error}"
+                ctx.error(error_message)
+                image_results.append(error_message)
         
         elapsed = asyncio.get_event_loop().time() - start_time
         success_count = sum(1 for r in image_results if isinstance(r, Image))
@@ -447,7 +484,7 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | s
     except Exception as e:
         logger.exception("Error in fetch_images")
         ctx.error(f"Failed to process images: {str(e)}")
-        return [f"Failed to process images: {str(e)}"] * len(image_sources)
+        return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
 if __name__ == "__main__":
     mcp.run(transport='stdio')

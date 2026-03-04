@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "cairosvg>=2.7.0",
     "httpx>=0.28.1",
     "mcp[cli]>=1.2.1",
     "pillow>=11.1.0",
