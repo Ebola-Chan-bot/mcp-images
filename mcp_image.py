@@ -390,7 +390,7 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     return ordered_results
 
 @mcp.tool()
-async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | None]:
+async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | str]:
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
     
@@ -406,7 +406,7 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | N
         image_sources: A list of image URLs or local file paths. For a single image, provide a one-element list.
         
     Returns:
-        A list of Image objects or None values (if processing failed) in the same order as the input sources.
+        A list of Image objects or error message strings in the same order as the input sources.
     """
     try:
         start_time = asyncio.get_event_loop().time()
@@ -425,16 +425,18 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | N
         # Process all images
         results = await process_images_async(image_sources, ctx)
         
-        # Extract just the Image objects or None values
+        # Extract Image objects or error messages
         image_results = []
         for result in results:
             if "image" in result:
                 image_results.append(result["image"])
+            elif "error" in result:
+                image_results.append(result["error"])
             else:
-                image_results.append(None)
+                image_results.append("Unknown error processing image")
         
         elapsed = asyncio.get_event_loop().time() - start_time
-        success_count = sum(1 for r in image_results if r is not None)
+        success_count = sum(1 for r in image_results if isinstance(r, Image))
         
         logger.debug(
             f"Processed {len(image_sources)} images in {elapsed:.2f} seconds. "
@@ -445,7 +447,7 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | N
     except Exception as e:
         logger.exception("Error in fetch_images")
         ctx.error(f"Failed to process images: {str(e)}")
-        return [None] * len(image_sources)
+        return [f"Failed to process images: {str(e)}"] * len(image_sources)
 
 if __name__ == "__main__":
     mcp.run(transport='stdio')
