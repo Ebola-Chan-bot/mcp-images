@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "mcp-image"
-version = "0.1.0"
-description = "Add your description here"
+name = "MCP读图"
+version = "1.0.0"
+description = "An MCP server for fetching and processing images from URLs and local files, with robust SVG support."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,3 +14,9 @@ dependencies = [
     "mcp[cli]>=1.2.1",
     "pillow>=11.1.0",
 ]
+
+[project.scripts]
+mcp-image-server = "mcp_image:main"
+
+[tool.setuptools]
+py-modules = ["mcp_image"]

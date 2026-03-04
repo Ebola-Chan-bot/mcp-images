@@ -34,55 +34,43 @@ Your contributions go a long way in fueling our passion for creating intelligent
 ## Prerequisites
 - Python 3.10+
 ## Installation
-1. Clone this repository
-2. Install dependencies using one of the following methods:
+This server is designed to be used without cloning the repository. You can use it directly via `uvx` (recommended) or install it via `pip`.
 
-### Option A: Using uv (with virtual environment)
-`uv run` will automatically create a virtual environment and install everything from `pyproject.toml`:
+### Option A: Using uvx (Zero-install, Recommended)
+If you have [uv](https://docs.astral.sh/uv/) installed, you can run the server directly:
 ```bash
-uv run python mcp_image.py
+uvx MCP读图
 ```
 
-### Option B: Using pip (user-level, no virtual environment)
+### Option B: Using pip (User-level or Global)
+You can install the package directly from PyPI (once published):
 ```bash
-pip install httpx "mcp[cli]" pillow pycairo reportlab rlpycairo svglib
+pip install MCP读图
 ```
-Then run directly with system Python:
+Then start the server using the compiled executable:
 ```bash
-python mcp_image.py
+mcp-image-server
 ```
+
 ## Running the Server
-There are two ways to run the MCP server:
+The easiest way to use this is to configure it in your MCP client (like Cursor, Windsurf, or Claude Desktop).
 
-### 1. Direct Method
-To start the MCP server directly:
-
-```bash
-# With uv (auto venv):
-uv run python mcp_image.py
-
-# Or with user-level pip:
-python mcp_image.py
-```
-### 2. Configure for Windsurf/Cursor
+### Configure for Windsurf/Cursor
 #### Windsurf
-To add this MCP server to Windsurf:
-
-1. Edit the configuration file at ~/.codeium/windsurf/mcp_config.json
-2. Add the following configuration:
+To add this MCP server to Windsurf, edit the configuration file at `~/.codeium/windsurf/mcp_config.json`:
 ```json
 {
   "mcpServers": {
     "image": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/mcp-image", "run", "mcp_image.py"]
+      "command": "uvx",
+      "args": ["MCP读图"]
     }
   }
 }
 ```
+
 #### Cursor
 To add this MCP server to Cursor:
-
 1. Open Cursor and go to *Settings* (Navbar → Cursor Settings)
 2. Navigate to *Features* → *MCP Servers*
 3. Click on + Add New MCP Server
@@ -91,34 +79,32 @@ To add this MCP server to Cursor:
 {
   "mcpServers": {
     "image": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/mcp-image", "run", "mcp_image.py"]
+      "command": "uvx",
+      "args": ["MCP读图"]
     }
   }
 }
 ```
-#### VS Code
+
+#### VS Code (Claude Dev)
 Add to your user or workspace `mcp.json` (settings):
 ```json
-// Using uv (auto venv):
+// Using uvx (Recommended):
 {
-  "servers": {
+  "mcpServers": {
     "image-service": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/mcp-image", "python", "mcp_image.py"]
+      "command": "uvx",
+      "args": ["MCP读图"]
     }
   }
 }
 
-// Or using system Python (user-level pip):
+// Or using system Python if installed via PIP:
 {
-  "servers": {
+  "mcpServers": {
     "image-service": {
-      "type": "stdio",
-      "command": "python",
-      "args": ["/path/to/mcp-image/mcp_image.py"],
-      "env": { "PYTHONUNBUFFERED": "1" }
+      "command": "mcp-image-server",
+      "args": []
     }
   }
 }
