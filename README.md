@@ -25,7 +25,7 @@ Your contributions go a long way in fueling our passion for creating intelligent
 ## Features
 - Fetch images from URLs (http/https)
 - Load images from local file paths
-- **SVG support** — automatically converts SVG files to PNG via `svglib` + `reportlab`, with configurable DPI
+- **SVG support** — automatically converts SVG files to PNG via `cairosvg`, with configurable DPI
 - Specialized handling for large local images
 - Automatic image compression for large images (>1MB)
 - Parallel processing of multiple images
@@ -33,6 +33,14 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - Comprehensive error handling and logging
 ## Prerequisites
 - Python 3.10+
+- On Windows: a Cairo DLL must be discoverable at runtime. Common sources include GTK3 Runtime, Tesseract-OCR, or Balabolka. See [Environment Variables](#environment-variables) if the default search paths don't match your setup.
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `CAIRO_DLL_DIRS` | **(Windows only)** `os.pathsep`-separated list of directories containing `libcairo-2.dll`. When set, these directories are added to the DLL search path. When not set, the program falls back to a built-in list of common locations (`GTK3-Runtime`, `Tesseract-OCR`, `Balabolka`). |
+
 ## Installation
 1. Clone this repository
 2. Install dependencies using one of the following methods:
@@ -45,7 +53,7 @@ uv run python mcp_image.py
 
 ### Option B: Using pip (user-level, no virtual environment)
 ```bash
-pip install httpx "mcp[cli]" pillow pycairo reportlab rlpycairo svglib
+pip install httpx "mcp[cli]" pillow cairosvg
 ```
 Then run directly with system Python:
 ```bash
@@ -134,7 +142,9 @@ Parameters:
 - `svg_dpi` (optional, default: `150`): DPI for SVG to PNG conversion. Higher values produce clearer images but larger files.
 
 Returns:
-- List of processed Image objects suitable for LLM consumption
+- A list with one entry per item in `image_sources`. Each entry is either:
+  - a processed Image object suitable for LLM consumption (on success), or
+  - a human-readable error string describing why that particular image could not be fetched or processed (on failure).
 
 ### Usage Examples
 You can now use commands like:

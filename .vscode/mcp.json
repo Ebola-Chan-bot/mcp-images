@@ -1,0 +1,11 @@
+{
+	"servers": {
+		"mcp_image": {
+			"command": "python",
+			"args": [
+				"C:\\Users\\vhtmf\\source\\repos\\mcp-images\\mcp_image.py"
+			]
+		}
+	},
+	"inputs": []
+}

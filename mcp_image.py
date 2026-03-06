@@ -2,6 +2,7 @@
 
 import os
 import sys
+import re
 import asyncio
 import httpx
 import logging
@@ -12,16 +13,26 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP, Image, Context
 from typing import List, Dict, Any, Union, Optional
 
-# Ensure Cairo DLL is findable on Windows
+# Ensure Cairo DLL is findable on Windows.
+# Set CAIRO_DLL_DIRS (os.pathsep-separated) to override DLL search paths.
+# Hardcoded fallbacks are kept for common apps that bundle cairo on Windows,
+# so users without the env var set can still work out-of-the-box.
 if sys.platform == "win32":
-    _cairo_dll_dirs = [
-        r"C:\Program Files\Tesseract-OCR",
-        r"C:\Program Files (x86)\Balabolka\utils",
-    ]
-    for _d in _cairo_dll_dirs:
-        if os.path.isdir(_d):
-            os.add_dll_directory(_d)
-            break
+    _cairo_env = os.getenv("CAIRO_DLL_DIRS")
+    if _cairo_env:
+        for _d in _cairo_env.split(os.pathsep):
+            if _d and os.path.isdir(_d):
+                os.add_dll_directory(_d)
+    else:
+        _cairo_dll_dirs = [
+            r"C:\Program Files\GTK3-Runtime Win64\bin",
+            r"C:\Program Files\Tesseract-OCR",
+            r"C:\Program Files (x86)\Balabolka\utils",
+        ]
+        for _d in _cairo_dll_dirs:
+            if os.path.isdir(_d):
+                os.add_dll_directory(_d)
+                break
 
 import cairosvg
 
@@ -187,11 +198,25 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
         
         # Handle SVG files by converting to PNG first
         if ext == "svg":
-            logger.debug(f"SVG file detected: {file_path}, converting to PNG")
+            svg_dpi = max(50, min(svg_dpi, 1200))  # Clamp DPI to prevent excessive memory usage
+            logger.debug(f"SVG file detected: {file_path}, converting to PNG at {svg_dpi} DPI")
             try:
                 with open(file_path, "rb") as f:
                     svg_data = f.read()
-                png_data = cairosvg.svg2png(bytestring=svg_data, dpi=svg_dpi)
+
+                # Add font fallbacks for Emoji/CJK characters in Cairo on Windows.
+                # Prepend only Segoe UI Emoji so emoji glyphs are found first;
+                # append CJK fonts after the original fonts to preserve intentional font choices
+                # (e.g. KaiTi, SimSun) while still providing a fallback for missing CJK glyphs.
+                text_data = svg_data.decode("utf-8", errors="ignore")
+                text_data = re.sub(
+                    r"font-family:\s*([^;\"'\>\<\}]+)",
+                    r"font-family: 'Segoe UI Emoji', \1, 'Microsoft YaHei', 'PingFang SC'",
+                    text_data,
+                )
+                svg_data_with_fonts = text_data.encode("utf-8")
+
+                png_data = cairosvg.svg2png(bytestring=svg_data_with_fonts, dpi=svg_dpi)
                 logger.debug(f"Converted SVG to PNG: {len(png_data)} bytes")
                 processed_image = await process_image_data(png_data, "png", file_path, ctx)
                 if processed_image is None:
