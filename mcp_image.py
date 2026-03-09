@@ -13,16 +13,24 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP, Image, Context
 from typing import List, Dict, Any, Union, Optional
 
-# Ensure Cairo DLL is findable on Windows
+# Ensure Cairo DLL is findable on Windows.
+# Set CAIRO_DLL_DIRS (os.pathsep-separated) to override DLL search paths.
 if sys.platform == "win32":
-    _cairo_dll_dirs = [
-        r"C:\Program Files\Tesseract-OCR",
-        r"C:\Program Files (x86)\Balabolka\utils",
-    ]
-    for _d in _cairo_dll_dirs:
-        if os.path.isdir(_d):
-            os.add_dll_directory(_d)
-            break
+    _cairo_env = os.getenv("CAIRO_DLL_DIRS")
+    if _cairo_env:
+        for _d in _cairo_env.split(os.pathsep):
+            if _d and os.path.isdir(_d):
+                os.add_dll_directory(_d)
+    else:
+        _cairo_dll_dirs = [
+            r"C:\Program Files\GTK3-Runtime Win64\bin",
+            r"C:\Program Files\Tesseract-OCR",
+            r"C:\Program Files (x86)\Balabolka\utils",
+        ]
+        for _d in _cairo_dll_dirs:
+            if os.path.isdir(_d):
+                os.add_dll_directory(_d)
+                break
 
 import cairosvg
 
@@ -188,16 +196,20 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
         
         # Handle SVG files by converting to PNG first
         if ext == "svg":
-            logger.debug(f"SVG file detected: {file_path}, converting to PNG")
+            svg_dpi = max(50, min(svg_dpi, 1200))
+            logger.debug(f"SVG file detected: {file_path}, converting to PNG at {svg_dpi} DPI")
             try:
                 with open(file_path, "rb") as f:
                     svg_data = f.read()
-                    
-                # Add font fallbacks to prevent missing CJK/Emoji characters (squares/misrendering) in Cairo on Windows.
-                # Emoji/CJK fonts MUST come first so Cairo picks them before Arial for special glyphs.
+
+                # Prepend Emoji font and append CJK fallback fonts so special glyphs render,
+                # while preserving the original font preference for normal text.
                 text_data = svg_data.decode("utf-8", errors="ignore")
-                fallback = r"font-family: 'Segoe UI Emoji', 'Microsoft YaHei', 'PingFang SC', \1"
-                text_data = re.sub(r"font-family:([^;\"'\>\<\}]+)", fallback, text_data)
+                text_data = re.sub(
+                    r"font-family:\s*([^;\"'\>\<\}]+)",
+                    r"font-family: 'Segoe UI Emoji', \1, 'Microsoft YaHei', 'PingFang SC'",
+                    text_data,
+                )
                 svg_data_with_fonts = text_data.encode("utf-8")
 
                 png_data = cairosvg.svg2png(bytestring=svg_data_with_fonts, dpi=svg_dpi)

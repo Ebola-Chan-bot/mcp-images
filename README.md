@@ -1,105 +1,104 @@
-# MCP Server - Image
-A Model Context Protocol (MCP) server that provides tools for fetching and processing images from URLs, local file paths (including SVG files). The server includes a tool called fetch_images that returns images in a format suitable for LLMs.
+# MCP 图片服务
 
-## Support Us
+这是一个基于 Model Context Protocol（MCP）的图片读取服务，用于从网络地址或本地路径读取图片，并将结果以适合大语言模型消费的格式返回。项目支持常见位图格式，也支持将 SVG 自动转换为 PNG 后再处理。
 
-If you find this project helpful and would like to support future projects, consider buying us a coffee! Your support helps us continue building innovative AI solutions.
+## 功能特性
 
-<a href="https://www.buymeacoffee.com/blazzmocompany"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=&slug=blazzmocompany&button_colour=40DCA5&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00"></a>
+- 支持读取 HTTP/HTTPS 图片
+- 支持读取本地图片文件
+- 支持 SVG 自动转 PNG
+- 支持批量并发处理多张图片
+- 对大图自动压缩，降低传输体积
+- 对错误进行显式返回，便于 Agent 诊断问题
+- 在 Windows 上为 CairoSVG 提供更稳妥的字体与 DLL 兼容策略
 
-Your contributions go a long way in fueling our passion for creating intelligent and user-friendly applications.
+## 运行要求
 
-## Table of Contents
-- [Features](#features)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Running the Server](#running-the-server)
-  - [Direct Method](#1-direct-method)
-  - [Configure for Windsurf/Cursor](#2-configure-for-windsurfcursor)
-- [Available Tools](#available-tools)
-  - [Usage Examples](#usage-examples)
-- [Debugging](#debugging)
-- [Contributing](#contributing)
-- [License](#license)
+- Python 3.10 及以上
+- 如果在 Windows 上运行，并且 Cairo 相关 DLL 不在系统默认搜索路径中，需要配置 `CAIRO_DLL_DIRS`
 
-## Features
-- Fetch images from URLs (http/https)
-- Load images from local file paths
-- **SVG support** — automatically converts SVG files to PNG via `svglib` + `reportlab`, with configurable DPI
-- Specialized handling for large local images
-- Automatic image compression for large images (>1MB)
-- Parallel processing of multiple images
-- Proper MIME type mapping for different file extensions
-- Comprehensive error handling and logging
-## Prerequisites
-- Python 3.10+
-## Installation
-This server is designed to be used without cloning the repository. You can use it directly via `uvx` (recommended) or install it via `pip`.
+## 安装方式
 
-### Option A: Using uvx (Zero-install, Recommended)
-If you have [uv](https://docs.astral.sh/uv/) installed, you can run the server directly:
+推荐直接通过 GitHub 仓库使用 `uvx` 运行，或安装到当前用户环境，无需手动创建虚拟环境。
+
+### 方式一：使用 uvx
+
+安装好 [uv](https://docs.astral.sh/uv/) 后，可直接运行：
+
 ```bash
-uvx MCP读图
+uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images mcp-image-server
 ```
 
-### Option B: Using pip (User-level or Global)
-You can install the package directly from PyPI (once published):
+### 方式二：使用 pip 安装到用户环境
+
 ```bash
-pip install MCP读图
+pip install --user git+https://github.com/Ebola-Chan-bot/mcp-images
 ```
-Then start the server using the compiled executable:
+
+安装完成后可直接启动：
+
 ```bash
 mcp-image-server
 ```
 
-## Running the Server
-The easiest way to use this is to configure it in your MCP client (like Cursor, Windsurf, or Claude Desktop).
+## 环境变量
 
-### Configure for Windsurf/Cursor
-#### Windsurf
-To add this MCP server to Windsurf, edit the configuration file at `~/.codeium/windsurf/mcp_config.json`:
+| 变量名 | 说明 |
+| --- | --- |
+| `CAIRO_DLL_DIRS` | 仅 Windows 使用。值为多个目录组成的列表，目录之间使用 `os.pathsep` 分隔。程序会把这些目录加入 DLL 搜索路径，用于定位 `libcairo-2.dll` 等 Cairo 依赖。 |
+
+说明：如果未设置 `CAIRO_DLL_DIRS`，程序会尝试若干常见安装目录作为后备方案。
+
+## MCP 客户端配置
+
+### Windsurf
+
+将以下内容加入 `~/.codeium/windsurf/mcp_config.json`：
+
 ```json
 {
   "mcpServers": {
     "image": {
       "command": "uvx",
-      "args": ["MCP读图"]
+      "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images", "mcp-image-server"]
     }
   }
 }
 ```
 
-#### Cursor
-To add this MCP server to Cursor:
-1. Open Cursor and go to *Settings* (Navbar → Cursor Settings)
-2. Navigate to *Features* → *MCP Servers*
-3. Click on + Add New MCP Server
-4. Enter the following configuration:
+### Cursor
+
+在 Cursor 的 MCP Servers 配置中加入：
+
 ```json
 {
   "mcpServers": {
     "image": {
       "command": "uvx",
-      "args": ["MCP读图"]
+      "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images", "mcp-image-server"]
     }
   }
 }
 ```
 
-#### VS Code (Claude Dev)
-Add to your user or workspace `mcp.json` (settings):
+### VS Code
+
+在用户级或工作区级 `mcp.json` 中加入：
+
 ```json
-// Using uvx (Recommended):
 {
   "mcpServers": {
     "image-service": {
       "command": "uvx",
-      "args": ["MCP读图"]
+      "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images", "mcp-image-server"]
     }
   }
 }
+```
 
-// Or using system Python if installed via PIP:
+如果你已经通过 `pip install --user` 安装，也可以直接使用可执行入口：
+
+```json
 {
   "mcpServers": {
     "image-service": {
@@ -110,52 +109,42 @@ Add to your user or workspace `mcp.json` (settings):
 }
 ```
 
-## Available Tools
-The server provides the following tools:
+## 可用工具
 
-**fetch_images**: Fetch and process images from URLs or local file paths
+### fetch_images
 
-Parameters:
-- `image_sources` (required): List of URLs or file paths to images (including `.svg` files)
-- `svg_dpi` (optional, default: `150`): DPI for SVG to PNG conversion. Higher values produce clearer images but larger files.
+读取并处理网络图片或本地图片。
 
-Returns:
-- List of processed Image objects suitable for LLM consumption
+参数：
 
-### Usage Examples
-You can now use commands like:
+- `image_sources`：必填，字符串列表。每个元素可以是 URL 或本地文件路径。
+- `svg_dpi`：可选，默认值为 `150`。用于控制 SVG 转 PNG 时的 DPI，数值越高，清晰度越高，但内存和输出体积也可能越大。
 
-- "Fetch these images: [list of URLs or file paths]"
-- "Load and process this local image: [file_path]"
+返回值：
 
-#### Examples
-```
-# URL-only test
+- 返回一个与 `image_sources` 顺序一致的列表。
+- 每一项要么是成功处理后的 `Image` 对象，要么是对应图片的错误字符串。
+
+## 使用示例
+
+```text
+读取这些图片：
 [
-  "https://upload.wikimedia.org/wikipedia/commons/thumb/7/70/Chocolate_%28blue_background%29.jpg/400px-Chocolate_%28blue_background%29.jpg",
-  "https://imgs.search.brave.com/Sz7BdlhBoOmU4wZjnUkvgestdwmzOzrfc3GsiMr27Ik/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly9pbWdj/ZG4uc3RhYmxlZGlm/ZnVzaW9ud2ViLmNv/bS8yMDI0LzEwLzE4/LzJmOTY3NTViLTM0/YmQtNDczNi1iNDRh/LWJlMTVmNGM5MDBm/My5qcGc",
-  "https://shigacare.fukushi.shiga.jp/mumeixxx/img/main.png"
-]
-
-# Mixed URL and local file test
-[
-  "https://upload.wikimedia.org/wikipedia/commons/thumb/7/70/Chocolate_%28blue_background%29.jpg/400px-Chocolate_%28blue_background%29.jpg",
-  "C:\\Users\\username\\Pictures\\image1.jpg",
-  "https://imgs.search.brave.com/Sz7BdlhBoOmU4wZjnUkvgestdwmzOzrfc3GsiMr27Ik/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly9pbWdj/ZG4uc3RhYmxlZGlm/ZnVzaW9ud2ViLmNv/bS8yMDI0LzEwLzE4/LzJmOTY3NTViLTM0/YmQtNDczNi1iNDRh/LWJlMTVmNGM5MDBm/My5qcGc",
-  "C:\\Users\\username\\Pictures\\image2.jpg"
+  "https://example.com/a.png",
+  "C:/Users/username/Pictures/example.svg"
 ]
 ```
 
-## Debugging
-If you encounter any issues:
+## 调试说明
 
-1. Check that all dependencies are installed correctly
-2. Verify that the server is running and listening for connections
-3. For local image loading issues, ensure the file paths are correct and accessible
-4. For "Unsupported image type" errors, verify the content type handling
-5. Look for any error messages in the server output
-## Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
+如果运行失败，建议按以下顺序排查：
 
-## License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+1. 确认依赖已经正确安装
+2. 确认当前 Python 为用户环境或系统环境，而不是失效的虚拟环境
+3. 确认本地图片路径存在且有读取权限
+4. 在 Windows 上检查 Cairo DLL 是否可被找到
+5. 查看程序标准错误输出和 `data` 目录下的日志文件
+
+## 许可证
+
+本项目使用 MIT 许可证。详见 [LICENSE](LICENSE)。

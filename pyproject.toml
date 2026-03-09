@@ -3,17 +3,33 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "MCP读图"
+name = "mcp-image-server"
 version = "1.0.0"
-description = "An MCP server for fetching and processing images from URLs and local files, with robust SVG support."
+description = "一个用于读取和处理网络图片与本地图片的 MCP 服务，支持稳健的 SVG 转 PNG。"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+keywords = ["mcp", "image", "svg", "llm", "cursor", "windsurf"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "cairosvg>=2.7.0",
     "httpx>=0.28.1",
     "mcp[cli]>=1.2.1",
     "pillow>=11.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Ebola-Chan-bot/mcp-images"
+Repository = "https://github.com/Ebola-Chan-bot/mcp-images"
+Issues = "https://github.com/Ebola-Chan-bot/mcp-images/issues"
 
 [project.scripts]
 mcp-image-server = "mcp_image:main"
