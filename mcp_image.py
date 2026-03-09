@@ -3,6 +3,7 @@
 import os
 import sys
 import re
+import importlib
 import asyncio
 import httpx
 import logging
@@ -31,8 +32,6 @@ if sys.platform == "win32":
             if os.path.isdir(_d):
                 os.add_dll_directory(_d)
                 break
-
-import cairosvg
 
 MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
 TEMP_DIR = "./Temp"
@@ -65,6 +64,45 @@ logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 # Prevent double logging
 logger.propagate = False
+
+_cairosvg_module = None
+_cairosvg_error = None
+
+
+def get_svg_support_error_message() -> str:
+    """Return a user-facing error message describing why SVG support is unavailable."""
+    if isinstance(_cairosvg_error, ModuleNotFoundError):
+        return (
+            "SVG support is unavailable because the Python package 'cairosvg' is not installed. "
+            "Install the package and restart the server."
+        )
+
+    return (
+        "SVG support is unavailable because CairoSVG could not load the system Cairo/libcairo library. "
+        "Install Cairo and restart the server, or set CAIRO_DLL_DIRS on Windows."
+    )
+
+
+def get_cairosvg():
+    """Load CairoSVG lazily so missing libcairo only disables SVG support."""
+    global _cairosvg_module, _cairosvg_error
+
+    if _cairosvg_module is not None:
+        return _cairosvg_module
+
+    if _cairosvg_error is not None:
+        return None
+
+    try:
+        _cairosvg_module = importlib.import_module("cairosvg")
+        return _cairosvg_module
+    except Exception as exc:
+        _cairosvg_error = exc
+        logger.warning(
+            "SVG support disabled because CairoSVG/libcairo could not be loaded: %s",
+            exc,
+        )
+        return None
 
 # Create a FastMCP server instance
 mcp = FastMCP("image-service")
@@ -198,6 +236,12 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
         if ext == "svg":
             svg_dpi = max(50, min(svg_dpi, 1200))
             logger.debug(f"SVG file detected: {file_path}, converting to PNG at {svg_dpi} DPI")
+            cairosvg = get_cairosvg()
+            if cairosvg is None:
+                error_msg = get_svg_support_error_message()
+                ctx.error(error_msg)
+                logger.error("Skipping SVG %s: %s", file_path, error_msg)
+                return {"path": file_path, "error": error_msg}
             try:
                 with open(file_path, "rb") as f:
                     svg_data = f.read()
