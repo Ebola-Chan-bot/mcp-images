@@ -14,6 +14,21 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP, Image, Context
 from typing import List, Dict, Any, Union, Optional
 
+WINDOWS_CAIRO_FALLBACK_DIRS = [
+    r"C:\Program Files\GTK3-Runtime Win64\bin",
+    r"C:\Program Files\Tesseract-OCR",
+    r"C:\Program Files (x86)\Balabolka\utils",
+]
+
+_cairo_added_dirs: List[str] = []
+
+
+def _add_cairo_dll_directory(path: str) -> None:
+    if os.path.isdir(path):
+        os.add_dll_directory(path)
+        _cairo_added_dirs.append(path)
+
+
 # Ensure Cairo DLL is findable on Windows.
 # Set CAIRO_DLL_DIRS (os.pathsep-separated) to override DLL search paths.
 if sys.platform == "win32":
@@ -21,16 +36,11 @@ if sys.platform == "win32":
     if _cairo_env:
         for _d in _cairo_env.split(os.pathsep):
             if _d and os.path.isdir(_d):
-                os.add_dll_directory(_d)
+                _add_cairo_dll_directory(_d)
     else:
-        _cairo_dll_dirs = [
-            r"C:\Program Files\GTK3-Runtime Win64\bin",
-            r"C:\Program Files\Tesseract-OCR",
-            r"C:\Program Files (x86)\Balabolka\utils",
-        ]
-        for _d in _cairo_dll_dirs:
+        for _d in WINDOWS_CAIRO_FALLBACK_DIRS:
             if os.path.isdir(_d):
-                os.add_dll_directory(_d)
+                _add_cairo_dll_directory(_d)
                 break
 
 MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
@@ -69,6 +79,117 @@ _cairosvg_module = None
 _cairosvg_error = None
 
 
+def _dedupe_paths(paths: List[str]) -> List[str]:
+    seen: set[str] = set()
+    result: List[str] = []
+    for path in paths:
+        if not path:
+            continue
+        normalized = os.path.normcase(os.path.normpath(path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(path)
+    return result
+
+
+def _split_existing_dirs(raw_value: str) -> List[str]:
+    if not raw_value:
+        return []
+    parts = [part.strip().strip('"') for part in raw_value.split(os.pathsep)]
+    return [part for part in parts if part]
+
+
+def _find_cairo_dll_dirs(paths: List[str]) -> List[str]:
+    matches: List[str] = []
+    for path in paths:
+        if os.path.isfile(os.path.join(path, "libcairo-2.dll")):
+            matches.append(path)
+    return _dedupe_paths(matches)
+
+
+def _find_relevant_path_entries(paths: List[str]) -> List[str]:
+    keywords = ("cairo", "gtk", "tesseract", "balabolka")
+    matches: List[str] = []
+    for path in paths:
+        lower_path = path.lower()
+        if any(keyword in lower_path for keyword in keywords):
+            matches.append(path)
+    return _dedupe_paths(matches)
+
+
+def _format_debug_list(title: str, values: List[str], limit: int = 8) -> List[str]:
+    if not values:
+        return [f"{title}: <none>"]
+    lines = [f"{title}:"]
+    for value in values[:limit]:
+        lines.append(f"  - {value}")
+    if len(values) > limit:
+        lines.append(f"  - ... ({len(values) - limit} more)")
+    return lines
+
+
+def _get_windows_cairo_diagnostics() -> str:
+    cairo_env = os.getenv("CAIRO_DLL_DIRS", "")
+    configured_dirs = _split_existing_dirs(cairo_env) if cairo_env else WINDOWS_CAIRO_FALLBACK_DIRS.copy()
+    valid_configured_dirs = [path for path in configured_dirs if os.path.isdir(path)]
+    invalid_configured_dirs = [path for path in configured_dirs if path and not os.path.isdir(path)]
+
+    path_dirs = _split_existing_dirs(os.getenv("PATH", ""))
+    relevant_path_dirs = _find_relevant_path_entries(path_dirs)
+    dll_dirs = _dedupe_paths(_find_cairo_dll_dirs(valid_configured_dirs) + _find_cairo_dll_dirs(path_dirs))
+
+    normalized_path_dirs = {os.path.normcase(os.path.normpath(path)) for path in path_dirs}
+    path_contains_configured_dir = any(
+        os.path.normcase(os.path.normpath(path)) in normalized_path_dirs for path in valid_configured_dirs
+    )
+
+    if cairo_env and not valid_configured_dirs:
+        failure_type = "CAIRO_DLL_DIRS 已设置，但所有配置目录都无效或不存在。"
+    elif dll_dirs:
+        failure_type = "检测到了 libcairo-2.dll 候选文件，但加载仍然失败，通常表示依赖链缺失或 PATH 未包含所需运行库目录。"
+    elif cairo_env:
+        failure_type = "已设置 CAIRO_DLL_DIRS，但在这些目录及当前 PATH 中都没有找到可加载的 libcairo-2.dll。"
+    else:
+        failure_type = "当前进程环境中未发现可加载的 libcairo-2.dll。"
+
+    lines = [
+        "SVG support is unavailable because CairoSVG could not load libcairo on Windows.",
+        "",
+        f"Server: {mcp.name}",
+        f"Process command line: {sys.executable} {' '.join(sys.argv)}".rstrip(),
+        "",
+        "Failure type:",
+        f"  {failure_type}",
+        "",
+        "Detected environment:",
+        f"  CAIRO_DLL_DIRS={cairo_env or '<not set>'}",
+        f"  PATH contains configured dir: {str(path_contains_configured_dir).lower()}",
+        f"  PATH contains Cairo-related dir: {str(bool(relevant_path_dirs)).lower()}",
+    ]
+
+    lines.extend(_format_debug_list("Valid configured dirs", valid_configured_dirs))
+    lines.extend(_format_debug_list("Invalid configured dirs", invalid_configured_dirs))
+    lines.extend(_format_debug_list("DLL directories added at startup", _cairo_added_dirs))
+    lines.extend(_format_debug_list("Directories containing libcairo-2.dll", dll_dirs))
+    lines.extend(_format_debug_list("Relevant PATH entries", relevant_path_dirs))
+
+    lines.extend([
+        "",
+        "Suggested fix:",
+        "  1. Install a Cairo runtime if it is not already installed (for example GTK runtime).",
+        "  2. In mcp.json, set both:",
+        "     - CAIRO_DLL_DIRS=<folder containing libcairo-2.dll>",
+        "     - PATH=<same folder>;%PATH%",
+        "  3. Restart the image-service MCP server.",
+        "",
+        "Original loader error:",
+        f"  {_cairosvg_error}",
+    ])
+
+    return "\n".join(lines)
+
+
 def get_svg_support_error_message() -> str:
     """Return a user-facing error message describing why SVG support is unavailable."""
     if isinstance(_cairosvg_error, ModuleNotFoundError):
@@ -76,6 +197,9 @@ def get_svg_support_error_message() -> str:
             "SVG support is unavailable because the Python package 'cairosvg' is not installed. "
             "Install the package and restart the server."
         )
+
+    if sys.platform == "win32":
+        return _get_windows_cairo_diagnostics()
 
     return (
         "SVG support is unavailable because CairoSVG could not load the system Cairo/libcairo library. "

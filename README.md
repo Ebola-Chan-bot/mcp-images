@@ -50,6 +50,7 @@ mcp-image-server
 | `CAIRO_DLL_DIRS` | 仅 Windows 使用。值为多个目录组成的列表，目录之间使用 `os.pathsep` 分隔。程序会把这些目录加入 DLL 搜索路径，用于定位 `libcairo-2.dll` 等 Cairo 依赖。 |
 
 说明：如果未设置 `CAIRO_DLL_DIRS`，程序会尝试若干常见安装目录作为后备方案。
+如果在 Windows 下仍然出现 SVG/Cairo 加载失败，通常还需要在 MCP 配置里同时把同一目录加入 `PATH`，否则即使 `libcairo-2.dll` 主文件存在，它依赖的其他 DLL 也可能无法被解析。
 
 ## MCP 客户端配置
 
