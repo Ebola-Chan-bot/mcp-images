@@ -90,7 +90,7 @@ mcp-image-server
 
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "image-service": {
       "command": "uvx",
       "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images", "mcp-image-server"]
@@ -103,7 +103,7 @@ mcp-image-server
 
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "image-service": {
       "command": "mcp-image-server",
       "args": []
