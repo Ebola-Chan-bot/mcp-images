@@ -1,0 +1,13 @@
+{
+	"servers": {
+		"image-service": {
+			"command": "C:\\Users\\vhtmf\\AppData\\Local\\Microsoft\\WindowsApps\\python3.13.exe",
+			"args": ["C:\\Users\\vhtmf\\source\\repos\\mcp-images\\mcp_image.py"],
+			"env": {
+				"CAIRO_DLL_DIRS": "C:\\Program Files\\GTK3-Runtime Win64\\bin",
+				"PATH": "C:\\Program Files\\GTK3-Runtime Win64\\bin;${env:PATH}"
+			}
+		}
+	},
+	"inputs": []
+}

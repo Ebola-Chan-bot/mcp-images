@@ -373,6 +373,17 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
                 # Prepend Emoji font and append CJK fallback fonts so special glyphs render,
                 # while preserving the original font preference for normal text.
                 text_data = svg_data.decode("utf-8", errors="ignore")
+                def inject_font_family_attr(match: re.Match[str]) -> str:
+                    quote = match.group(1)
+                    font_value = match.group(2)
+                    injected = f"'Segoe UI Emoji', {font_value}, 'Microsoft YaHei', 'PingFang SC'"
+                    return f"font-family={quote}{injected}{quote}"
+
+                text_data = re.sub(
+                    r"font-family\s*=\s*([\"'])(.*?)\1",
+                    inject_font_family_attr,
+                    text_data,
+                )
                 text_data = re.sub(
                     r"font-family:\s*([^;\"'\>\<\}]+)",
                     r"font-family: 'Segoe UI Emoji', \1, 'Microsoft YaHei', 'PingFang SC'",
