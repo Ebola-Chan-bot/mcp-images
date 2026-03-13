@@ -373,11 +373,43 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
                 # Prepend Emoji font and append CJK fallback fonts so special glyphs render,
                 # while preserving the original font preference for normal text.
                 text_data = svg_data.decode("utf-8", errors="ignore")
+                emoji_pattern = re.compile(r"[\U0001F300-\U0001FAFF]")
+                symbol_pattern = re.compile(r"[\u0391-\u03C9\u2206\u220F\u2211\u03BC]")
+
                 def inject_font_family_attr(match: re.Match[str]) -> str:
                     quote = match.group(1)
                     font_value = match.group(2)
-                    injected = f"'Segoe UI Emoji', {font_value}, 'Microsoft YaHei', 'PingFang SC'"
+                    injected = f"{font_value}, 'Microsoft YaHei', 'PingFang SC', 'Arial Unicode MS'"
                     return f"font-family={quote}{injected}{quote}"
+
+                def retag_text_node(match: re.Match[str]) -> str:
+                    attrs = match.group(1)
+                    content = match.group(2)
+                    preferred_fonts = None
+
+                    if emoji_pattern.search(content):
+                        preferred_fonts = "'Segoe UI Emoji', 'Segoe UI Symbol'"
+                    elif symbol_pattern.search(content):
+                        preferred_fonts = "'Arial', 'Cambria Math', 'Segoe UI Symbol'"
+
+                    if preferred_fonts is None:
+                        return match.group(0)
+
+                    def prepend_attr_font(attr_match: re.Match[str]) -> str:
+                        quote = attr_match.group(1)
+                        value = attr_match.group(2)
+                        return f"font-family={quote}{preferred_fonts}, {value}{quote}"
+
+                    updated_attrs = re.sub(
+                        r"font-family\s*=\s*([\"'])(.*?)\1",
+                        prepend_attr_font,
+                        attrs,
+                        count=1,
+                    )
+                    if updated_attrs == attrs:
+                        updated_attrs = f'{attrs} font-family="{preferred_fonts}"'
+
+                    return f"<text{updated_attrs}>{content}</text>"
 
                 text_data = re.sub(
                     r"font-family\s*=\s*([\"'])(.*?)\1",
@@ -386,9 +418,10 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
                 )
                 text_data = re.sub(
                     r"font-family:\s*([^;\"'\>\<\}]+)",
-                    r"font-family: 'Segoe UI Emoji', \1, 'Microsoft YaHei', 'PingFang SC'",
+                    r"font-family: \1, 'Microsoft YaHei', 'PingFang SC', 'Arial Unicode MS'",
                     text_data,
                 )
+                text_data = re.sub(r"<text([^>]*)>(.*?)</text>", retag_text_node, text_data, flags=re.DOTALL)
                 svg_data_with_fonts = text_data.encode("utf-8")
 
                 png_data = cairosvg.svg2png(bytestring=svg_data_with_fonts, dpi=svg_dpi)
