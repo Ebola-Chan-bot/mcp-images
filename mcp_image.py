@@ -400,10 +400,20 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
                         value = attr_match.group(2)
                         return f"font-family={quote}{preferred_fonts}, {value}{quote}"
 
+                    def prepend_style_font(style_match: re.Match[str]) -> str:
+                        # 修复 style 内 font-family 未被定向覆盖，导致 emoji/symbol 节点仍被 Arial 抢占而显示为方块。
+                        return f"font-family: {preferred_fonts}, {style_match.group(1)}"
+
                     updated_attrs = re.sub(
                         r"font-family\s*=\s*([\"'])(.*?)\1",
                         prepend_attr_font,
                         attrs,
+                        count=1,
+                    )
+                    updated_attrs = re.sub(
+                        r"font-family:\s*([^;\"'\>\<\}]+)",
+                        prepend_style_font,
+                        updated_attrs,
                         count=1,
                     )
                     if updated_attrs == attrs:
