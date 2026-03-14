@@ -118,6 +118,27 @@ def _find_relevant_path_entries(paths: List[str]) -> List[str]:
     return _dedupe_paths(matches)
 
 
+def _image_has_transparency(img: PILImage.Image) -> bool:
+    if img.mode in ("RGBA", "LA"):
+        return True
+    if img.mode == "P":
+        return "transparency" in img.info
+    return False
+
+
+def _save_processed_image(img: PILImage.Image, has_transparency: bool, quality: int) -> tuple[bytes, str]:
+    img_byte_arr = BytesIO()
+    # 修复大图压缩时透明背景被强制转成 JPEG 导致 alpha 丢失的问题。
+    if has_transparency:
+        png_img = img if img.mode in ("RGBA", "LA") else img.convert("RGBA")
+        png_img.save(img_byte_arr, format="PNG", optimize=True, compress_level=9)
+        return img_byte_arr.getvalue(), "png"
+
+    rgb_img = img if img.mode == "RGB" else img.convert("RGB")
+    rgb_img.save(img_byte_arr, format="JPEG", quality=quality, optimize=True)
+    return img_byte_arr.getvalue(), "jpeg"
+
+
 def _format_debug_list(title: str, values: List[str], limit: int = 8) -> List[str]:
     if not values:
         return [f"{title}: <none>"]
@@ -262,6 +283,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                 orig_width, orig_height = img.size
                 orig_format = img.format
                 orig_mode = img.mode
+                has_transparency = _image_has_transparency(img)
                 logger.debug(f"Original image dimensions from {image_source}: {orig_width}x{orig_height}")
                 logger.debug(f"Large image format from PIL: {orig_format}, mode: {orig_mode}")
             
@@ -274,7 +296,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
             
             # Second pass: process the image
             with PILImage.open(temp_path) as img:
-                if img.mode in ('RGBA', 'P'):
+                if not has_transparency and img.mode in ('RGBA', 'P'):
                     img = img.convert('RGB')
                 
                 # Apply initial scale if needed
@@ -289,8 +311,6 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                 scale_factor = 1.0
                 
                 while True:
-                    img_byte_arr = BytesIO()
-                    
                     # Create a copy for this iteration to avoid accumulating transforms
                     if scale_factor < 1.0:
                         current_width = int(width * scale_factor)
@@ -300,8 +320,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                         current_img = img
                         current_width, current_height = width, height
                     
-                    current_img.save(img_byte_arr, format='JPEG', quality=quality, optimize=True)
-                    processed_data = img_byte_arr.getvalue()
+                    processed_data, output_format = _save_processed_image(current_img, has_transparency, quality)
                     
                     # Clean up the temporary image if we created one
                     if scale_factor < 1.0 and hasattr(current_img, 'close'):
@@ -310,11 +329,11 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                     # Target 800KB to leave buffer for any MCP overhead
                     if len(processed_data) <= 819200:  # 800KB
                         logger.debug(f"Processed image dimensions from {image_source}: {current_width}x{current_height} (quality={quality})")
-                        logger.debug(f"Returning processed image with format: jpeg, size: {len(processed_data)} bytes")
-                        return Image(data=processed_data, format='jpeg')
+                        logger.debug(f"Returning processed image with format: {output_format}, size: {len(processed_data)} bytes")
+                        return Image(data=processed_data, format=output_format)
                     
-                    # Try reducing quality first
-                    if quality > 20:
+                    # 修复透明 PNG 被误走 JPEG 降质分支的问题；透明图只能继续缩放，不能靠丢 alpha 压缩。
+                    if not has_transparency and quality > 20:
                         quality -= 10
                         logger.debug(f"Reducing quality to {quality} for {image_source}, current size: {len(processed_data)} bytes")
                     else:
@@ -498,6 +517,7 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
             orig_width, orig_height = img.size
             orig_format = img.format
             orig_mode = img.mode
+            has_transparency = _image_has_transparency(img)
             logger.debug(f"Original large local image dimensions from {file_path}: {orig_width}x{orig_height}")
             logger.debug(f"Original image format: {orig_format}, mode: {orig_mode}")
         
@@ -510,7 +530,7 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
         
         # Second pass: process the image
         with PILImage.open(file_path) as img:
-            if img.mode in ('RGBA', 'P'):
+            if not has_transparency and img.mode in ('RGBA', 'P'):
                 img = img.convert('RGB')
             
             # Apply initial scale if needed
@@ -525,9 +545,6 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
             scale_factor = 1.0
             
             while True:
-                # Save the processed image to a temporary BytesIO
-                img_byte_arr = BytesIO()
-                
                 # Create a copy for this iteration to avoid accumulating transforms
                 if scale_factor < 1.0:
                     current_width = int(width * scale_factor)
@@ -537,8 +554,7 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
                     current_img = img
                     current_width, current_height = width, height
                 
-                current_img.save(img_byte_arr, format='JPEG', quality=quality, optimize=True)
-                processed_data = img_byte_arr.getvalue()
+                processed_data, output_format = _save_processed_image(current_img, has_transparency, quality)
                 
                 # Clean up the temporary image if we created one
                 if scale_factor < 1.0 and hasattr(current_img, 'close'):
@@ -547,10 +563,10 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
                 # Target 800KB to leave buffer for any MCP overhead
                 if len(processed_data) <= 819200:  # 800KB
                     logger.debug(f"Successfully compressed large local image {file_path} to {len(processed_data)} bytes (quality={quality}, dimensions={current_width}x{current_height})")
-                    return {"path": file_path, "image": Image(data=processed_data, format='jpeg')}
+                    return {"path": file_path, "image": Image(data=processed_data, format=output_format)}
                 
-                # Try reducing quality first
-                if quality > 30:
+                # 修复本地透明图压缩时 alpha 被 JPEG 路径抹掉的问题。
+                if not has_transparency and quality > 30:
                     quality -= 10
                     logger.debug(f"Reducing quality to {quality} for {file_path}")
                 else:
