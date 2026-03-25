@@ -24,8 +24,9 @@ from xml.etree import ElementTree
 TEMP_DIR = "./Temp"
 DATA_DIR = "./data"
 CDP渲染脚本路径 = os.path.join(os.path.dirname(__file__), "SVG转PNG渲染器.py")
-SVG浏览器环境变量 = ("MCP图片浏览器路径",)
-SVG表情字体环境变量 = ("MCP图片表情字体路径",)
+# 修复启动参数与环境变量名称不一致的问题；优先使用与参数同名的环境变量，并兼容旧名称。
+SVG浏览器环境变量 = ("浏览器路径", "MCP图片浏览器路径")
+SVG表情字体环境变量 = ("表情字体路径", "MCP图片表情字体路径")
 MCP表情字体族名 = "MCPImageEmojiOverride"
 _启动浏览器路径: Optional[str] = None
 _启动表情字体路径: Optional[str] = None

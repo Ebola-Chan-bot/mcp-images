@@ -2,7 +2,7 @@
 
 这是一个基于 Model Context Protocol (MCP) 的图片读取服务，用于把网络图片或本地图片转换成适合大模型消费的 `Image` 对象。项目支持常见位图格式，也支持把 SVG 通过 Chromium DevTools Protocol 渲染成 PNG 后再返回。
 
-## 当前实现概览
+## 功能特性
 
 - 支持 HTTP / HTTPS 图片
 - 支持本地文件路径
@@ -15,10 +15,10 @@
 
 ## 运行依赖
 
-根据当前源码，服务启动和 SVG 渲染依赖如下：
+服务启动和 SVG 渲染依赖如下：
 
 - Python 3.10 及以上
-- 一个可用的 Chromium 内核浏览器，源码会优先尝试这些候选项：
+- 一个可用的 Chromium 内核浏览器，常见候选项包括：
   - Windows: Edge、Chrome、Chromium
   - macOS: Chrome、Edge、Chromium
   - Linux: google-chrome、microsoft-edge、chromium
@@ -28,41 +28,48 @@
 
 - 普通 PNG、JPG、WebP 等位图不依赖浏览器渲染。
 - SVG 渲染会调用 [SVG转PNG渲染器.py](SVG转PNG渲染器.py) 并通过浏览器截图生成 PNG，因此 Chromium 浏览器是 SVG 能否工作的关键前提。
-- 当前源码中已经不再使用 README 旧版本里提到的 `CAIRO_DLL_DIRS` 方案。
 
 ## 推荐启动方式
 
-当前仓库最稳妥的运行方式，是直接从仓库目录启动源码，而不是依赖旧文档里的远程 `uvx` 示例。
+推荐使用 uv 直接从 GitHub 的发布 tag 获取并运行，无需手动克隆仓库。
 
-先安装 Python 依赖：
+先安装 uv：
 
 ```bash
-pip install --user -e .
+pip install --user uv
 ```
 
-这会一并安装 CDP 通信用到的 Python websocket 客户端，无需再安装 Node.js。
-
-然后可直接启动：
+然后直接启动服务：
 
 ```bash
-python mcp_image.py
-```
-
-也可以使用打包后的入口：
-
-```bash
-mcp-image-server
+uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 mcp-image-server
 ```
 
 如果你要确保服务使用指定浏览器或指定 emoji 字体，可以在启动时显式传入参数：
 
 ```bash
-python mcp_image.py --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --表情字体路径 "C:\Windows\Fonts\seguiemj.ttf"
+uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 mcp-image-server --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --表情字体路径 "C:\Windows\Fonts\seguiemj.ttf"
 ```
+
+如果你希望把命令安装到本机，也可以使用：
+
+```bash
+uv tool install --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 mcp-image-server
+```
+
+安装后可直接运行：
+
+```bash
+mcp-image-server
+```
+
+升级到新版本时，把命令中的 `@v1.0.0` 替换成新的发布 tag 即可。
+
+本地开发或调试时，才需要在仓库目录中直接运行源码。
 
 ## 启动参数与环境变量
 
-源码当前支持两类启动配置。
+服务支持两类启动配置。
 
 ### 启动参数
 
@@ -75,26 +82,26 @@ python mcp_image.py --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\App
 
 | 变量名 | 说明 |
 | --- | --- |
-| `MCP图片浏览器路径` | 指定 Chromium 浏览器可执行文件路径 |
-| `MCP图片表情字体路径` | 指定彩色 emoji 字体路径 |
+| `浏览器路径` | 指定 Chromium 浏览器可执行文件路径 |
+| `表情字体路径` | 指定彩色 emoji 字体路径 |
 
 参数优先级如下：
 
 1. `fetch_images` 工具调用时传入的 `浏览器路径` / `表情字体路径`
 2. 服务进程启动参数 `--浏览器路径` / `--表情字体路径`
 3. 环境变量
-4. 源码内置的默认探测路径
+4. 默认探测路径
 
 ## VS Code 配置
 
-当前仓库对应的工作区级 [.vscode/mcp.json](.vscode/mcp.json) 已按源码更新为本地启动模式：
+在 VS Code 中，可以这样配置 MCP 服务：
 
 ```json
 {
   "servers": {
     "image-service": {
-      "command": "python",
-      "args": ["${workspaceFolder}\\mcp_image.py"]
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0", "mcp-image-server"]
     }
   },
   "inputs": []
@@ -107,9 +114,11 @@ python mcp_image.py --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\App
 {
   "servers": {
     "image-service": {
-      "command": "python",
+      "command": "uvx",
       "args": [
-        "${workspaceFolder}\\mcp_image.py",
+        "--from",
+        "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0",
+        "mcp-image-server",
         "--浏览器路径",
         "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
         "--表情字体路径",
@@ -123,13 +132,11 @@ python mcp_image.py --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\App
 
 ## 其他 MCP 客户端
 
-其他 MCP 客户端也应遵循同一个原则：
+其他 MCP 客户端可参考以下原则配置：
 
-- `command` 指向可用的 Python
-- `args` 指向当前仓库中的 `mcp_image.py`
+- `command` 使用 `uvx`
+- `args` 使用 `--from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 mcp-image-server`
 - 如果需要，再额外追加 `--浏览器路径` 和 `--表情字体路径`
-
-不要再继续使用旧版 README 中依赖 Cairo 配置的示例。
 
 ## 可用工具
 
@@ -175,7 +182,7 @@ python mcp_image.py --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\App
 
 - [mcp_image.py](mcp_image.py)：MCP 服务主程序
 - [SVG转PNG渲染器.py](SVG转PNG渲染器.py)：通过 CDP 控制 Chromium 渲染 SVG 的辅助脚本
-- [.vscode/mcp.json](.vscode/mcp.json)：当前工作区的 VS Code MCP 配置
+- [.vscode/mcp.json](.vscode/mcp.json)：VS Code MCP 配置示例
 
 ## 许可证
 
