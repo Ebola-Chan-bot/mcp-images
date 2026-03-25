@@ -147,7 +147,7 @@ mcp-image-server
 参数：
 
 - `image_sources`：必填，字符串列表。每个元素可以是 URL 或本地文件路径
-- `svg_dpi`：必填。控制 SVG 转 PNG 时的渲染 DPI
+- `svg_dpi`：当 `image_sources` 中包含 SVG 时必填。控制 SVG 转 PNG 时的渲染 DPI
 - `浏览器路径`：可选。单次调用覆盖服务默认浏览器路径
 - `表情字体路径`：可选。单次调用覆盖服务默认 emoji 字体路径
 

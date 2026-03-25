@@ -793,6 +793,15 @@ def is_url(path_or_url: str) -> bool:
     parsed = urlparse(path_or_url)
     return bool(parsed.scheme and parsed.netloc)
 
+
+def _输入包含SVG(image_sources: List[str]) -> bool:
+    # 修复 fetch_images 将 svg_dpi 无条件声明为必填，导致非 SVG 输入也被错误约束的问题。
+    for source in image_sources:
+        candidate_path = urlparse(source).path if is_url(source) else source
+        if candidate_path.lower().endswith(".svg"):
+            return True
+    return False
+
 async def process_images_async(
     image_sources: List[str],
     ctx: Context,
@@ -862,8 +871,8 @@ async def process_images_async(
 async def fetch_images(
     image_sources: List[str],
     ctx: Context,
-    # 修复 Agent 调用时 svg_dpi 被当作可选参数导致调用约束不明确的问题。
-    svg_dpi: int,
+    # 修复非 SVG 输入也被强制要求提供 svg_dpi 的问题；仅在输入包含 SVG 时才要求显式传入。
+    svg_dpi: Optional[int] = None,
     浏览器路径: Optional[str] = None,
     表情字体路径: Optional[str] = None,
 ):
@@ -880,7 +889,7 @@ async def fetch_images(
     
     Args:
         image_sources: A list of image URLs or local file paths. For a single image, provide a one-element list.
-        svg_dpi: Required DPI for SVG to PNG conversion. Higher values produce clearer images but larger files.
+        svg_dpi: Required only when image_sources contains SVG files. Higher values produce clearer images but larger files.
         浏览器路径: 可选。单次调用覆盖默认浏览器路径。
         表情字体路径: 可选。单次调用覆盖默认 emoji 字体路径。
         
@@ -896,6 +905,16 @@ async def fetch_images(
             ctx.error("No image sources provided")
             logger.error("fetch_images called with empty source list")
             return []
+
+        if _输入包含SVG(image_sources):
+            if svg_dpi is None:
+                # 修复 SVG 输入缺少 svg_dpi 时继续带着空值向下游传递的问题。
+                error_message = "svg_dpi is required when image_sources contains SVG files"
+                ctx.error(error_message)
+                logger.error(error_message)
+                return [error_message for _ in image_sources]
+        else:
+            svg_dpi = 150
         
         # Log the types of sources we're processing
         url_count = sum(1 for src in image_sources if is_url(src))
