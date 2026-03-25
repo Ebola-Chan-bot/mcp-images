@@ -1,12 +1,8 @@
 {
 	"servers": {
 		"image-service": {
-			"command": "C:\\Users\\vhtmf\\AppData\\Local\\Microsoft\\WindowsApps\\python3.13.exe",
-			"args": ["C:\\Users\\vhtmf\\source\\repos\\mcp-images\\mcp_image.py"],
-			"env": {
-				"CAIRO_DLL_DIRS": "C:\\Program Files\\Tesseract-OCR",
-				"PATH": "C:\\Program Files\\Tesseract-OCR;${env:PATH}"
-			}
+			"command": "python",
+			"args": ["${workspaceFolder}\\mcp_image.py"]
 		}
 	},
 	"inputs": []

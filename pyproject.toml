@@ -20,10 +20,10 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "cairosvg>=2.7.0",
     "httpx>=0.28.1",
     "mcp[cli]>=1.2.1",
     "pillow>=11.1.0",
+    "websocket-client>=1.8.0",
 ]
 
 [project.urls]
@@ -35,4 +35,4 @@ Issues = "https://github.com/Ebola-Chan-bot/mcp-images/issues"
 mcp-image-server = "mcp_image:main"
 
 [tool.setuptools]
-py-modules = ["mcp_image"]
+py-modules = ["mcp_image", "SVG转PNG渲染器"]

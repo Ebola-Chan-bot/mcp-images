@@ -3,49 +3,62 @@
 import os
 import sys
 import re
-import importlib
+import json
 import asyncio
+import shutil
+import socket
+import argparse
+import tempfile
+import subprocess
 import httpx
 import logging
 from io import BytesIO
 from datetime import datetime
 from PIL import Image as PILImage
+from pathlib import Path
 from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP, Image, Context
-from typing import List, Dict, Any, Union, Optional
+from typing import List, Dict, Any, Optional
+from xml.etree import ElementTree
 
-WINDOWS_CAIRO_FALLBACK_DIRS = [
-    r"C:\Program Files\GTK3-Runtime Win64\bin",
-    r"C:\Program Files\Tesseract-OCR",
-    r"C:\Program Files (x86)\Balabolka\utils",
-]
-
-_cairo_added_dirs: List[str] = []
-
-
-def _add_cairo_dll_directory(path: str) -> None:
-    if os.path.isdir(path):
-        os.add_dll_directory(path)
-        _cairo_added_dirs.append(path)
-
-
-# Ensure Cairo DLL is findable on Windows.
-# Set CAIRO_DLL_DIRS (os.pathsep-separated) to override DLL search paths.
-if sys.platform == "win32":
-    _cairo_env = os.getenv("CAIRO_DLL_DIRS")
-    if _cairo_env:
-        for _d in _cairo_env.split(os.pathsep):
-            if _d and os.path.isdir(_d):
-                _add_cairo_dll_directory(_d)
-    else:
-        for _d in WINDOWS_CAIRO_FALLBACK_DIRS:
-            if os.path.isdir(_d):
-                _add_cairo_dll_directory(_d)
-                break
-
-MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
 TEMP_DIR = "./Temp"
 DATA_DIR = "./data"
+CDP渲染脚本路径 = os.path.join(os.path.dirname(__file__), "SVG转PNG渲染器.py")
+SVG浏览器环境变量 = ("MCP图片浏览器路径",)
+SVG表情字体环境变量 = ("MCP图片表情字体路径",)
+MCP表情字体族名 = "MCPImageEmojiOverride"
+_启动浏览器路径: Optional[str] = None
+_启动表情字体路径: Optional[str] = None
+
+浏览器候选项 = {
+    "win32": [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "msedge",
+        "chrome",
+        "chromium",
+    ],
+    "darwin": [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "google-chrome",
+        "microsoft-edge",
+        "chromium",
+    ],
+    "linux": [
+        "google-chrome",
+        "microsoft-edge",
+        "chromium",
+        "chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/microsoft-edge",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ],
+}
 
 # Ensure directories exist
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -75,47 +88,22 @@ logger.addHandler(console_handler)
 # Prevent double logging
 logger.propagate = False
 
-_cairosvg_module = None
-_cairosvg_error = None
+表情文本正则 = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u200D\uFE0F]+")
 
-
-def _dedupe_paths(paths: List[str]) -> List[str]:
-    seen: set[str] = set()
-    result: List[str] = []
-    for path in paths:
-        if not path:
-            continue
-        normalized = os.path.normcase(os.path.normpath(path))
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        result.append(path)
-    return result
-
-
-def _split_existing_dirs(raw_value: str) -> List[str]:
-    if not raw_value:
-        return []
-    parts = [part.strip().strip('"') for part in raw_value.split(os.pathsep)]
-    return [part for part in parts if part]
-
-
-def _find_cairo_dll_dirs(paths: List[str]) -> List[str]:
-    matches: List[str] = []
-    for path in paths:
-        if os.path.isfile(os.path.join(path, "libcairo-2.dll")):
-            matches.append(path)
-    return _dedupe_paths(matches)
-
-
-def _find_relevant_path_entries(paths: List[str]) -> List[str]:
-    keywords = ("cairo", "gtk", "tesseract", "balabolka")
-    matches: List[str] = []
-    for path in paths:
-        lower_path = path.lower()
-        if any(keyword in lower_path for keyword in keywords):
-            matches.append(path)
-    return _dedupe_paths(matches)
+彩色表情字体候选项 = {
+    "win32": [
+        r"C:\Windows\Fonts\seguiemj.ttf",
+    ],
+    "darwin": [
+        "/System/Library/Fonts/Apple Color Emoji.ttc",
+    ],
+    "linux": [
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/google-noto-color-emoji/NotoColorEmoji.ttf",
+        "/usr/local/share/fonts/NotoColorEmoji.ttf",
+    ],
+}
 
 
 def _image_has_transparency(img: PILImage.Image) -> bool:
@@ -139,115 +127,320 @@ def _save_processed_image(img: PILImage.Image, has_transparency: bool, quality: 
     return img_byte_arr.getvalue(), "jpeg"
 
 
-def _format_debug_list(title: str, values: List[str], limit: int = 8) -> List[str]:
-    if not values:
-        return [f"{title}: <none>"]
-    lines = [f"{title}:"]
-    for value in values[:limit]:
-        lines.append(f"  - {value}")
-    if len(values) > limit:
-        lines.append(f"  - ... ({len(values) - limit} more)")
-    return lines
-
-
-def _get_windows_cairo_diagnostics() -> str:
-    cairo_env = os.getenv("CAIRO_DLL_DIRS", "")
-    configured_dirs = _split_existing_dirs(cairo_env) if cairo_env else WINDOWS_CAIRO_FALLBACK_DIRS.copy()
-    valid_configured_dirs = [path for path in configured_dirs if os.path.isdir(path)]
-    invalid_configured_dirs = [path for path in configured_dirs if path and not os.path.isdir(path)]
-
-    path_dirs = _split_existing_dirs(os.getenv("PATH", ""))
-    relevant_path_dirs = _find_relevant_path_entries(path_dirs)
-    dll_dirs = _dedupe_paths(_find_cairo_dll_dirs(valid_configured_dirs) + _find_cairo_dll_dirs(path_dirs))
-
-    normalized_path_dirs = {os.path.normcase(os.path.normpath(path)) for path in path_dirs}
-    path_contains_configured_dir = any(
-        os.path.normcase(os.path.normpath(path)) in normalized_path_dirs for path in valid_configured_dirs
-    )
-
-    if cairo_env and not valid_configured_dirs:
-        failure_type = "CAIRO_DLL_DIRS 已设置，但所有配置目录都无效或不存在。"
-    elif dll_dirs:
-        failure_type = "检测到了 libcairo-2.dll 候选文件，但加载仍然失败，通常表示依赖链缺失或 PATH 未包含所需运行库目录。"
-    elif cairo_env:
-        failure_type = "已设置 CAIRO_DLL_DIRS，但在这些目录及当前 PATH 中都没有找到可加载的 libcairo-2.dll。"
-    else:
-        failure_type = "当前进程环境中未发现可加载的 libcairo-2.dll。"
-
-    lines = [
-        "SVG support is unavailable because CairoSVG could not load libcairo on Windows.",
-        "",
-        f"Server: {mcp.name}",
-        f"Process command line: {sys.executable} {' '.join(sys.argv)}".rstrip(),
-        "",
-        "Failure type:",
-        f"  {failure_type}",
-        "",
-        "Detected environment:",
-        f"  CAIRO_DLL_DIRS={cairo_env or '<not set>'}",
-        f"  PATH contains configured dir: {str(path_contains_configured_dir).lower()}",
-        f"  PATH contains Cairo-related dir: {str(bool(relevant_path_dirs)).lower()}",
-    ]
-
-    lines.extend(_format_debug_list("Valid configured dirs", valid_configured_dirs))
-    lines.extend(_format_debug_list("Invalid configured dirs", invalid_configured_dirs))
-    lines.extend(_format_debug_list("DLL directories added at startup", _cairo_added_dirs))
-    lines.extend(_format_debug_list("Directories containing libcairo-2.dll", dll_dirs))
-    lines.extend(_format_debug_list("Relevant PATH entries", relevant_path_dirs))
-
-    lines.extend([
-        "",
-        "Suggested fix:",
-        "  1. Install a Cairo runtime if it is not already installed (for example GTK runtime).",
-        "  2. In mcp.json, set both:",
-        "     - CAIRO_DLL_DIRS=<folder containing libcairo-2.dll>",
-        "     - PATH=<same folder>;%PATH%",
-        "  3. Restart the image-service MCP server.",
-        "",
-        "Original loader error:",
-        f"  {_cairosvg_error}",
-    ])
-
-    return "\n".join(lines)
-
-
-def get_svg_support_error_message() -> str:
-    """Return a user-facing error message describing why SVG support is unavailable."""
-    if isinstance(_cairosvg_error, ModuleNotFoundError):
-        return (
-            "SVG support is unavailable because the Python package 'cairosvg' is not installed. "
-            "Install the package and restart the server."
-        )
-
-    if sys.platform == "win32":
-        return _get_windows_cairo_diagnostics()
-
-    return (
-        "SVG support is unavailable because CairoSVG could not load the system Cairo/libcairo library. "
-        "Install Cairo and restart the server, or set CAIRO_DLL_DIRS on Windows."
-    )
-
-
-def get_cairosvg():
-    """Load CairoSVG lazily so missing libcairo only disables SVG support."""
-    global _cairosvg_module, _cairosvg_error
-
-    if _cairosvg_module is not None:
-        return _cairosvg_module
-
-    if _cairosvg_error is not None:
+def _解析SVG长度(长度文本: Optional[str], dpi: float) -> Optional[int]:
+    if not 长度文本:
         return None
 
+    匹配结果 = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([a-z%]*)\s*", 长度文本)
+    if not 匹配结果:
+        return None
+
+    数值 = float(匹配结果.group(1))
+    单位 = 匹配结果.group(2).lower() or "px"
+    if 单位 == "px":
+        return max(1, int(round(数值)))
+    if 单位 == "in":
+        return max(1, int(round(数值 * dpi)))
+    if 单位 == "cm":
+        return max(1, int(round(数值 * dpi / 2.54)))
+    if 单位 == "mm":
+        return max(1, int(round(数值 * dpi / 25.4)))
+    if 单位 == "pt":
+        return max(1, int(round(数值 * dpi / 72.0)))
+    if 单位 == "pc":
+        return max(1, int(round(数值 * dpi / 6.0)))
+    return None
+
+
+def _查找现存字体路径(候选路径列表: List[str]) -> Optional[str]:
+    for 候选路径 in 候选路径列表:
+        if 候选路径 and os.path.isfile(候选路径):
+            return 候选路径
+    return None
+
+
+def _规范化可选路径(原始值: Optional[str]) -> Optional[str]:
+    if 原始值 is None:
+        return None
+    规范化结果 = 原始值.strip().strip('"')
+    return 规范化结果 or None
+
+
+def _解析现存可执行文件(路径或名称: Optional[str]) -> Optional[str]:
+    候选项 = _规范化可选路径(路径或名称)
+    if not 候选项:
+        return None
+
+    展开路径 = os.path.expanduser(候选项)
+    if os.path.isabs(展开路径) or os.sep in 展开路径 or (os.altsep and os.altsep in 展开路径):
+        return 展开路径 if os.path.isfile(展开路径) else None
+
+    已解析路径 = shutil.which(展开路径)
+    return 已解析路径 or None
+
+
+def _遍历默认浏览器候选项() -> List[str]:
+    return 浏览器候选项.get(sys.platform, 浏览器候选项.get("linux", []))
+
+
+def 解析SVG浏览器路径(浏览器路径: Optional[str] = None) -> str:
+    请求路径 = _规范化可选路径(浏览器路径)
+    if 请求路径:
+        已解析路径 = _解析现存可执行文件(请求路径)
+        if 已解析路径:
+            return 已解析路径
+        raise FileNotFoundError(f"配置的 SVG 浏览器路径不存在: {请求路径}")
+
+    for 候选项 in (_启动浏览器路径, *[os.getenv(name) for name in SVG浏览器环境变量]):
+        规范化结果 = _规范化可选路径(候选项)
+        if not 规范化结果:
+            continue
+        已解析路径 = _解析现存可执行文件(规范化结果)
+        if 已解析路径:
+            return 已解析路径
+        raise FileNotFoundError(f"配置的 SVG 浏览器路径不存在: {规范化结果}")
+
+    已检查项: List[str] = []
+    for 候选项 in _遍历默认浏览器候选项():
+        已检查项.append(候选项)
+        已解析路径 = _解析现存可执行文件(候选项)
+        if 已解析路径:
+            return 已解析路径
+
+    raise FileNotFoundError(
+        "未找到可用的 Chromium 浏览器。已检查: " + ", ".join(已检查项)
+    )
+
+
+def 解析表情字体路径(表情字体路径: Optional[str] = None) -> str:
+    请求路径 = _规范化可选路径(表情字体路径)
+    if 请求路径:
+        展开路径 = os.path.expanduser(请求路径)
+        if os.path.isfile(展开路径):
+            return 展开路径
+        raise FileNotFoundError(f"配置的 emoji 字体路径不存在: {请求路径}")
+
+    for 候选项 in (_启动表情字体路径, *[os.getenv(name) for name in SVG表情字体环境变量]):
+        规范化结果 = _规范化可选路径(候选项)
+        if not 规范化结果:
+            continue
+        展开路径 = os.path.expanduser(规范化结果)
+        if os.path.isfile(展开路径):
+            return 展开路径
+        raise FileNotFoundError(f"配置的 emoji 字体路径不存在: {规范化结果}")
+
+    已检查项 = 彩色表情字体候选项.get(sys.platform, [])
+    已解析路径 = _查找现存字体路径(已检查项)
+    if 已解析路径:
+        return 已解析路径
+
+    raise FileNotFoundError(
+        "未找到默认彩色 emoji 字体。已检查: " + ", ".join(已检查项)
+    )
+
+
+def _获取SVG目标尺寸(svg_data: bytes, dpi: int) -> tuple[int, int]:
     try:
-        _cairosvg_module = importlib.import_module("cairosvg")
-        return _cairosvg_module
-    except Exception as exc:
-        _cairosvg_error = exc
-        logger.warning(
-            "SVG support disabled because CairoSVG/libcairo could not be loaded: %s",
-            exc,
+        根元素 = ElementTree.fromstring(svg_data)
+        宽度 = _解析SVG长度(根元素.attrib.get("width"), dpi)
+        高度 = _解析SVG长度(根元素.attrib.get("height"), dpi)
+        if 宽度 and 高度:
+            return 宽度, 高度
+
+        视图框 = 根元素.attrib.get("viewBox")
+        if 视图框:
+            片段 = re.split(r"[\s,]+", 视图框.strip())
+            if len(片段) == 4:
+                视图框宽度 = max(1, int(round(float(片段[2]) * dpi / 96.0)))
+                视图框高度 = max(1, int(round(float(片段[3]) * dpi / 96.0)))
+                return 视图框宽度, 视图框高度
+    except Exception:
+        pass
+
+    return 300, 150
+
+
+def _获取空闲TCP端口() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as 套接字:
+        套接字.bind(("127.0.0.1", 0))
+        return int(套接字.getsockname()[1])
+
+
+def _去掉SVG文档前导(svg_text: str) -> str:
+    去掉XML声明后的文本 = re.sub(r"^\s*<\?xml[^>]*>\s*", "", svg_text, count=1)
+    return re.sub(r"^\s*<!DOCTYPE[^>]*>\s*", "", 去掉XML声明后的文本, count=1, flags=re.IGNORECASE)
+
+
+def _向SVG注入表情字体(svg_text: str, emoji_font_family: str) -> str:
+    优先字体 = f"'{emoji_font_family}'"
+
+    def 重写文本节点(匹配结果: re.Match[str]) -> str:
+        属性文本 = 匹配结果.group(1)
+        节点内容 = 匹配结果.group(2)
+        if not 表情文本正则.search(节点内容):
+            return 匹配结果.group(0)
+
+        def 前置属性字体(属性匹配: re.Match[str]) -> str:
+            引号 = 属性匹配.group(1)
+            原始值 = 属性匹配.group(2)
+            return f"font-family={引号}{优先字体}, {原始值}{引号}"
+
+        def 前置样式字体(样式匹配: re.Match[str]) -> str:
+            return f"font-family: {优先字体}, {样式匹配.group(1)}"
+
+        更新后的属性文本 = re.sub(
+            r"font-family\s*=\s*([\"'])(.*?)\1",
+            前置属性字体,
+            属性文本,
+            count=1,
         )
-        return None
+        更新后的属性文本 = re.sub(
+            r"font-family:\s*([^;\"'\>\<\}]+)",
+            前置样式字体,
+            更新后的属性文本,
+            count=1,
+        )
+        if 更新后的属性文本 == 属性文本:
+            更新后的属性文本 = f'{属性文本} font-family="{优先字体}"'
+
+        return f"<text{更新后的属性文本}>{节点内容}</text>"
+
+    return re.sub(r"<text([^>]*)>(.*?)</text>", 重写文本节点, svg_text, flags=re.DOTALL)
+
+
+def _构建SVG包装HTML(svg_text: str, width: int, height: int, 表情字体路径: str) -> str:
+    字体路径URI = Path(表情字体路径).resolve().as_uri()
+    清理后的SVG = _向SVG注入表情字体(_去掉SVG文档前导(svg_text), MCP表情字体族名)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset=\"utf-8\">
+  <style>
+    @font-face {{
+      font-family: '{MCP表情字体族名}';
+      src: url('{字体路径URI}');
+    }}
+
+    html, body {{
+      margin: 0;
+      padding: 0;
+      width: {width}px;
+      height: {height}px;
+      overflow: hidden;
+            /* 修复 CDP 截图时包装页白底覆盖 SVG 透明区域的问题。 */
+            background: transparent;
+    }}
+
+    svg {{
+      display: block;
+      width: {width}px;
+      height: {height}px;
+      overflow: visible;
+    }}
+  </style>
+</head>
+<body>{清理后的SVG}</body>
+</html>
+"""
+
+
+def 通过CDP渲染SVG到PNG(
+    svg_data: bytes,
+    svg_dpi: int,
+    浏览器路径: Optional[str] = None,
+    表情字体路径: Optional[str] = None,
+) -> bytes:
+    浏览器可执行文件 = 解析SVG浏览器路径(浏览器路径)
+    表情字体文件 = 解析表情字体路径(表情字体路径)
+    if not os.path.isfile(CDP渲染脚本路径):
+        raise FileNotFoundError(f"未找到 CDP 渲染脚本: {CDP渲染脚本路径}")
+
+    目标宽度, 目标高度 = _获取SVG目标尺寸(svg_data, svg_dpi)
+    调试端口 = _获取空闲TCP端口()
+
+    with tempfile.TemporaryDirectory(prefix="svg-cdp-", dir=TEMP_DIR) as 工作目录:
+        包装页路径 = os.path.join(工作目录, "wrapper.html")
+        PNG输出路径 = os.path.join(工作目录, "rendered.png")
+        报告路径 = os.path.join(工作目录, "render-report.json")
+        浏览器配置目录 = os.path.join(工作目录, "profile")
+        SVG文本 = svg_data.decode("utf-8", errors="replace")
+        HTML文本 = _构建SVG包装HTML(SVG文本, 目标宽度, 目标高度, 表情字体文件)
+        with open(包装页路径, "w", encoding="utf-8") as handle:
+            handle.write(HTML文本)
+
+        命令 = [
+            sys.executable,
+            CDP渲染脚本路径,
+            浏览器可执行文件,
+            Path(包装页路径).resolve().as_uri(),
+            PNG输出路径,
+            报告路径,
+            浏览器配置目录,
+            str(调试端口),
+            str(目标宽度),
+            str(目标高度),
+        ]
+        # 修复 MCP stdio 模式下子渲染进程继承服务 stdin 管道后可能卡住的问题。
+        运行结果 = subprocess.run(
+            命令,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        if 运行结果.returncode != 0:
+            失败详情 = (运行结果.stderr or 运行结果.stdout or "CDP 渲染失败").strip()
+            raise RuntimeError(失败详情)
+        if not os.path.isfile(PNG输出路径):
+            raise RuntimeError("CDP 渲染器未生成输出 PNG")
+
+        with open(PNG输出路径, "rb") as handle:
+            return handle.read()
+
+
+def _解析启动参数(argv: Optional[List[str]] = None) -> List[str]:
+    参数解析器 = argparse.ArgumentParser(add_help=False)
+    参数解析器.add_argument("--浏览器路径", dest="浏览器路径")
+    参数解析器.add_argument("--表情字体路径", dest="表情字体路径")
+    启动参数, 剩余参数 = 参数解析器.parse_known_args(argv)
+
+    global _启动浏览器路径, _启动表情字体路径
+    # 修复服务进程无法从启动参数接收浏览器路径的问题。
+    _启动浏览器路径 = _规范化可选路径(启动参数.浏览器路径)
+    # 修复服务进程无法从启动参数接收 emoji 字体路径的问题。
+    _启动表情字体路径 = _规范化可选路径(启动参数.表情字体路径)
+    return 剩余参数
+
+
+async def _处理SVG字节(
+    svg_data: bytes,
+    image_source: str,
+    ctx: Context,
+    svg_dpi: int,
+    浏览器路径: Optional[str] = None,
+    表情字体路径: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        svg_dpi = max(50, min(svg_dpi, 1200))
+        logger.debug("检测到 SVG 图片: %s，按 %s DPI 通过 CDP 渲染", image_source, svg_dpi)
+        png_data = await asyncio.to_thread(
+            通过CDP渲染SVG到PNG,
+            svg_data,
+            svg_dpi,
+            浏览器路径,
+            表情字体路径,
+        )
+        处理后图片 = await process_image_data(png_data, "png", image_source, ctx)
+        if 处理后图片 is None:
+            return {"error": "处理 SVG 图片失败"}
+        return {"image": 处理后图片}
+    except Exception as exc:
+        错误信息 = f"转换 SVG {image_source} 时出错: {str(exc)}"
+        ctx.error(错误信息)
+        logger.exception(错误信息)
+        return {"error": 错误信息}
+
 
 # Create a FastMCP server instance
 mcp = FastMCP("image-service")
@@ -362,7 +555,13 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
         logger.exception(f"Unexpected error processing {image_source}")
         return None
 
-async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) -> Dict[str, Any]:
+async def process_local_image(
+    file_path: str,
+    ctx: Context,
+    svg_dpi: int = 150,
+    浏览器路径: Optional[str] = None,
+    表情字体路径: Optional[str] = None,
+) -> Dict[str, Any]:
     """Processes a local image file and returns a dictionary with the result."""
     try:
         if not os.path.exists(file_path):
@@ -377,90 +576,21 @@ async def process_local_image(file_path: str, ctx: Context, svg_dpi: int = 150) 
         
         # Handle SVG files by converting to PNG first
         if ext == "svg":
-            svg_dpi = max(50, min(svg_dpi, 1200))
-            logger.debug(f"SVG file detected: {file_path}, converting to PNG at {svg_dpi} DPI")
-            cairosvg = get_cairosvg()
-            if cairosvg is None:
-                error_msg = get_svg_support_error_message()
-                ctx.error(error_msg)
-                logger.error("Skipping SVG %s: %s", file_path, error_msg)
-                return {"path": file_path, "error": error_msg}
             try:
                 with open(file_path, "rb") as f:
                     svg_data = f.read()
-
-                # Prepend Emoji font and append CJK fallback fonts so special glyphs render,
-                # while preserving the original font preference for normal text.
-                text_data = svg_data.decode("utf-8", errors="ignore")
-                emoji_pattern = re.compile(r"[\U0001F300-\U0001FAFF]")
-                symbol_pattern = re.compile(r"[\u0391-\u03C9\u2206\u220F\u2211\u03BC]")
-
-                def inject_font_family_attr(match: re.Match[str]) -> str:
-                    quote = match.group(1)
-                    font_value = match.group(2)
-                    injected = f"{font_value}, 'Microsoft YaHei', 'PingFang SC', 'Arial Unicode MS'"
-                    return f"font-family={quote}{injected}{quote}"
-
-                def retag_text_node(match: re.Match[str]) -> str:
-                    attrs = match.group(1)
-                    content = match.group(2)
-                    preferred_fonts = None
-
-                    if emoji_pattern.search(content):
-                        preferred_fonts = "'Segoe UI Emoji', 'Segoe UI Symbol'"
-                    elif symbol_pattern.search(content):
-                        preferred_fonts = "'Arial', 'Cambria Math', 'Segoe UI Symbol'"
-
-                    if preferred_fonts is None:
-                        return match.group(0)
-
-                    def prepend_attr_font(attr_match: re.Match[str]) -> str:
-                        quote = attr_match.group(1)
-                        value = attr_match.group(2)
-                        return f"font-family={quote}{preferred_fonts}, {value}{quote}"
-
-                    def prepend_style_font(style_match: re.Match[str]) -> str:
-                        # 修复 style 内 font-family 未被定向覆盖，导致 emoji/symbol 节点仍被 Arial 抢占而显示为方块。
-                        return f"font-family: {preferred_fonts}, {style_match.group(1)}"
-
-                    updated_attrs = re.sub(
-                        r"font-family\s*=\s*([\"'])(.*?)\1",
-                        prepend_attr_font,
-                        attrs,
-                        count=1,
-                    )
-                    updated_attrs = re.sub(
-                        r"font-family:\s*([^;\"'\>\<\}]+)",
-                        prepend_style_font,
-                        updated_attrs,
-                        count=1,
-                    )
-                    if updated_attrs == attrs:
-                        updated_attrs = f'{attrs} font-family="{preferred_fonts}"'
-
-                    return f"<text{updated_attrs}>{content}</text>"
-
-                text_data = re.sub(
-                    r"font-family\s*=\s*([\"'])(.*?)\1",
-                    inject_font_family_attr,
-                    text_data,
+                SVG处理结果 = await _处理SVG字节(
+                    svg_data,
+                    file_path,
+                    ctx,
+                    svg_dpi,
+                    浏览器路径=浏览器路径,
+                    表情字体路径=表情字体路径,
                 )
-                text_data = re.sub(
-                    r"font-family:\s*([^;\"'\>\<\}]+)",
-                    r"font-family: \1, 'Microsoft YaHei', 'PingFang SC', 'Arial Unicode MS'",
-                    text_data,
-                )
-                text_data = re.sub(r"<text([^>]*)>(.*?)</text>", retag_text_node, text_data, flags=re.DOTALL)
-                svg_data_with_fonts = text_data.encode("utf-8")
-
-                png_data = cairosvg.svg2png(bytestring=svg_data_with_fonts, dpi=svg_dpi)
-                logger.debug(f"Converted SVG to PNG: {len(png_data)} bytes")
-                processed_image = await process_image_data(png_data, "png", file_path, ctx)
-                if processed_image is None:
-                    return {"path": file_path, "error": "Failed to process SVG image"}
-                return {"path": file_path, "image": processed_image}
+                SVG处理结果["path"] = file_path
+                return SVG处理结果
             except Exception as e:
-                error_msg = f"Error converting SVG {file_path}: {str(e)}"
+                error_msg = f"转换 SVG {file_path} 时出错: {str(e)}"
                 ctx.error(error_msg)
                 logger.exception(error_msg)
                 return {"path": file_path, "error": error_msg}
@@ -597,7 +727,14 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
-async def fetch_single_image(url: str, client: httpx.AsyncClient, ctx: Context) -> Dict[str, Any]:
+async def fetch_single_image(
+    url: str,
+    client: httpx.AsyncClient,
+    ctx: Context,
+    svg_dpi: int = 150,
+    浏览器路径: Optional[str] = None,
+    表情字体路径: Optional[str] = None,
+) -> Dict[str, Any]:
     """Fetches and processes a single image asynchronously."""
     try:
         parsed = urlparse(url)
@@ -617,6 +754,18 @@ async def fetch_single_image(url: str, client: httpx.AsyncClient, ctx: Context) 
 
         logger.debug(f"Fetched image from {url} with {len(response.content)} bytes")
         logger.debug(f"Content-Type from server: {content_type}")
+
+        if content_type.startswith("image/svg") or content_type.endswith("+xml"):
+            SVG处理结果 = await _处理SVG字节(
+                response.content,
+                url,
+                ctx,
+                svg_dpi,
+                浏览器路径=浏览器路径,
+                表情字体路径=表情字体路径,
+            )
+            SVG处理结果["url"] = url
+            return SVG处理结果
         
         # Extract the format from content-type
         format_type = content_type.split('/')[-1]
@@ -643,7 +792,13 @@ def is_url(path_or_url: str) -> bool:
     parsed = urlparse(path_or_url)
     return bool(parsed.scheme and parsed.netloc)
 
-async def process_images_async(image_sources: List[str], ctx: Context, svg_dpi: int = 150) -> List[Dict[str, Any]]:
+async def process_images_async(
+    image_sources: List[str],
+    ctx: Context,
+    svg_dpi: int = 150,
+    浏览器路径: Optional[str] = None,
+    表情字体路径: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Process multiple images (URLs or local files) concurrently."""
     if not image_sources:
         raise ValueError("No image sources provided")
@@ -658,14 +813,33 @@ async def process_images_async(image_sources: List[str], ctx: Context, svg_dpi: 
     if urls:
         logger.debug(f"Processing {len(urls)} URLs")
         async with httpx.AsyncClient() as client:
-            url_tasks = [fetch_single_image(url, client, ctx) for url in urls]
+            url_tasks = [
+                fetch_single_image(
+                    url,
+                    client,
+                    ctx,
+                    svg_dpi=svg_dpi,
+                    浏览器路径=浏览器路径,
+                    表情字体路径=表情字体路径,
+                )
+                for url in urls
+            ]
             url_results = await asyncio.gather(*url_tasks)
             results.extend(url_results)
     
     # Process local files if any
     if local_paths:
         logger.debug(f"Processing {len(local_paths)} local files")
-        local_tasks = [process_local_image(path, ctx, svg_dpi=svg_dpi) for path in local_paths]
+        local_tasks = [
+            process_local_image(
+                path,
+                ctx,
+                svg_dpi=svg_dpi,
+                浏览器路径=浏览器路径,
+                表情字体路径=表情字体路径,
+            )
+            for path in local_paths
+        ]
         local_results = await asyncio.gather(*local_tasks)
         results.extend(local_results)
     
@@ -684,7 +858,14 @@ async def process_images_async(image_sources: List[str], ctx: Context, svg_dpi: 
 # FastMCP uses Pydantic to inspect return types and generate JSON schemas for the MCP protocol.
 # Since `Image` is an arbitrary type and does not have `__get_pydantic_core_schema__` implemented,
 # adding a type hint like `List[Image]` will crash the server at startup with a PydanticSchemaGenerationError.
-async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 150):
+async def fetch_images(
+    image_sources: List[str],
+    ctx: Context,
+    # 修复 Agent 调用时 svg_dpi 被当作可选参数导致调用约束不明确的问题。
+    svg_dpi: int,
+    浏览器路径: Optional[str] = None,
+    表情字体路径: Optional[str] = None,
+):
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
     
@@ -698,7 +879,9 @@ async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 15
     
     Args:
         image_sources: A list of image URLs or local file paths. For a single image, provide a one-element list.
-        svg_dpi: DPI for SVG to PNG conversion. Higher values produce clearer images but larger files. Default: 150.
+        svg_dpi: Required DPI for SVG to PNG conversion. Higher values produce clearer images but larger files.
+        浏览器路径: 可选。单次调用覆盖默认浏览器路径。
+        表情字体路径: 可选。单次调用覆盖默认 emoji 字体路径。
         
     Returns:
         A list in the same order as the input sources.
@@ -719,7 +902,13 @@ async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 15
         logger.debug(f"Processing {len(image_sources)} image sources: {url_count} URLs and {local_count} local files")
         
         # Process all images
-        results = await process_images_async(image_sources, ctx, svg_dpi=svg_dpi)
+        results = await process_images_async(
+            image_sources,
+            ctx,
+            svg_dpi=svg_dpi,
+            浏览器路径=浏览器路径,
+            表情字体路径=表情字体路径,
+        )
         
         # Extract Image objects, or explicit error messages for failures
         image_results = []
@@ -750,6 +939,8 @@ async def fetch_images(image_sources: List[str], ctx: Context, svg_dpi: int = 15
         return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
 def main():
+    剩余命令行参数 = _解析启动参数(sys.argv[1:])
+    sys.argv = [sys.argv[0], *剩余命令行参数]
     mcp.run(transport='stdio')
 
 if __name__ == "__main__":
