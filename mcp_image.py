@@ -5,6 +5,7 @@ import sys
 import re
 import json
 import asyncio
+import time
 import shutil
 import socket
 import argparse
@@ -363,6 +364,7 @@ def 通过CDP渲染SVG到PNG(
         包装页路径 = os.path.join(工作目录, "wrapper.html")
         PNG输出路径 = os.path.join(工作目录, "rendered.png")
         报告路径 = os.path.join(工作目录, "render-report.json")
+        状态路径 = os.path.join(工作目录, "render-status.json")
         浏览器配置目录 = os.path.join(工作目录, "profile")
         SVG文本 = svg_data.decode("utf-8", errors="replace")
         HTML文本 = _构建SVG包装HTML(SVG文本, 目标宽度, 目标高度, 表情字体文件)
@@ -376,22 +378,55 @@ def 通过CDP渲染SVG到PNG(
             Path(包装页路径).resolve().as_uri(),
             PNG输出路径,
             报告路径,
+            状态路径,
             浏览器配置目录,
             str(调试端口),
             str(目标宽度),
             str(目标高度),
         ]
-        # 修复 MCP stdio 模式下子渲染进程继承服务 stdin 管道后可能卡住的问题。
-        运行结果 = subprocess.run(
+        # 修复大 SVG 在 CDP 截图阶段只能盲等子进程退出，父进程无法区分慢渲染和卡死的问题。
+        渲染进程 = subprocess.Popen(
             命令,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            check=False,
         )
-        if 运行结果.returncode != 0:
-            失败详情 = (运行结果.stderr or 运行结果.stdout or "CDP 渲染失败").strip()
+        开始时间 = time.time()
+        上次状态时间戳 = None
+        最近状态描述 = "尚未收到状态"
+
+        while 渲染进程.poll() is None:
+            if os.path.isfile(状态路径):
+                try:
+                    with open(状态路径, "r", encoding="utf-8") as 状态文件:
+                        当前状态 = json.load(状态文件)
+                    最近状态描述 = 当前状态.get("阶段", 最近状态描述)
+                    上次状态时间戳 = 当前状态.get("时间戳", 上次状态时间戳)
+                except Exception:
+                    pass
+
+            已等待秒数 = time.time() - 开始时间
+            if 已等待秒数 > 240:
+                渲染进程.kill()
+                标准输出, 标准错误 = 渲染进程.communicate()
+                raise RuntimeError(
+                    f"CDP 渲染超时；最近状态：{最近状态描述}；标准错误：{(标准错误 or 标准输出 or '无')[:500]}"
+                )
+
+            if 上次状态时间戳 and time.time() - 上次状态时间戳 > 30:
+                渲染进程.kill()
+                标准输出, 标准错误 = 渲染进程.communicate()
+                raise RuntimeError(
+                    f"CDP 渲染状态心跳已停止；最近状态：{最近状态描述}；标准错误：{(标准错误 or 标准输出 or '无')[:500]}"
+                )
+
+            time.sleep(0.5)
+
+        标准输出, 标准错误 = 渲染进程.communicate()
+        if 渲染进程.returncode != 0:
+            失败详情 = (标准错误 or 标准输出 or "CDP 渲染失败").strip()
             raise RuntimeError(失败详情)
         if not os.path.isfile(PNG输出路径):
             raise RuntimeError("CDP 渲染器未生成输出 PNG")
