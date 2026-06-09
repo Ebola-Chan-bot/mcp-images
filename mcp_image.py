@@ -71,6 +71,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("mcp").setLevel(logging.WARNING)
+# 修复工具名含中文时 FastMCP 反复告警刷屏的问题；SEP-986 名称校验仅限 ASCII，中文工具名由 VS Code 侧清洗即可。
+logging.getLogger("mcp.shared.tool_name_validation").setLevel(logging.ERROR)
 
 # Configure our logger
 log_filename = os.path.join(DATA_DIR, datetime.now().strftime("%d-%m-%y.log"))
@@ -993,9 +995,242 @@ async def fetch_images(
         ctx.error(f"Failed to process images: {str(e)}")
         return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
+def _ensure_pymupdf():
+    """修复 pymupdf（约 70 MB）作为必装依赖导致初始安装过大的问题；改为首次调用 PDF 功能时按需安装。"""
+    global fitz
+    try:
+        import fitz
+    except ImportError:
+        logger.info("首次使用 PDF 功能，正在自动安装 PyMuPDF（约 70 MB），请稍候...")
+        import subprocess as _subprocess
+        _subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"],
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+        )
+        import fitz
+        logger.info("PyMuPDF 安装完成，继续处理 PDF")
+
+
+def _pdf单页转图像(
+    PDF路径: str,
+    页码: int,
+    输出格式: str = "png",
+    DPI: int = 150,
+) -> bytes:
+    """将 PDF 的单个页面渲染为 PNG/JPEG 图像字节。
+    
+    参数:
+        PDF路径: PDF 文件的绝对路径。
+        页码: 目标页码，从 1 开始计数。
+        输出格式: 输出图像格式，支持 "png" 或 "jpeg"。
+        DPI: 渲染分辨率，默认 150。
+    
+    返回:
+        渲染后的图像字节数据。
+    """
+    # 修复 PDF 文件不存在时 PyMuPDF 抛出晦涩错误的问题。
+    if not os.path.isfile(PDF路径):
+        raise FileNotFoundError(f"PDF 文件不存在: {PDF路径}")
+
+    _ensure_pymupdf()
+    文档 = None
+    try:
+        文档 = fitz.open(PDF路径)
+        总页数 = 文档.page_count
+
+        if 页码 < 1 or 页码 > 总页数:
+            raise ValueError(f"页码 {页码} 超出范围，PDF 共 {总页数} 页（页码从 1 开始）")
+
+        # 获取目标页面（PyMuPDF 内部页码从 0 开始）
+        页面 = 文档[页码 - 1]
+
+        # 将页面渲染为像素图
+        像素图 = 页面.get_pixmap(dpi=DPI)
+
+        if 输出格式 == "jpeg":
+            图像字节 = 像素图.tobytes("jpeg")
+        else:
+            图像字节 = 像素图.tobytes("png")
+
+        return 图像字节
+    finally:
+        if 文档 is not None:
+            文档.close()
+
+
+def _pdf全部页转图像(
+    PDF路径: str,
+    输出格式: str = "png",
+    DPI: int = 150,
+) -> List[Dict[str, Any]]:
+    """将 PDF 的全部页面渲染为图像列表。
+
+    参数:
+        PDF路径: PDF 文件的绝对路径。
+        输出格式: 输出图像格式。
+
+    返回:
+        列表，每项包含 "页码" 和 "图像字节"。
+    """
+    if not os.path.isfile(PDF路径):
+        raise FileNotFoundError(f"PDF 文件不存在: {PDF路径}")
+
+    _ensure_pymupdf()
+    文档 = None
+    try:
+        文档 = fitz.open(PDF路径)
+        总页数 = 文档.page_count
+        结果列表: List[Dict[str, Any]] = []
+
+        for 索引 in range(总页数):
+            页面 = 文档[索引]
+            像素图 = 页面.get_pixmap(dpi=DPI)
+            if 输出格式 == "jpeg":
+                图像字节 = 像素图.tobytes("jpeg")
+            else:
+                图像字节 = 像素图.tobytes("png")
+            结果列表.append({"页码": 索引 + 1, "图像字节": 图像字节})
+
+        return 结果列表
+    finally:
+        if 文档 is not None:
+            文档.close()
+
+
+@mcp.tool()
+async def PDF转图像(
+    PDF文件路径: str,
+    页码: Optional[List[int]] = None,
+    DPI: Optional[int] = None,
+    ctx: Context = None,
+):
+    """
+    将 PDF 文件的指定页面转换为图像，返回给智能体。
+
+    本工具支持将 PDF 文档的一页或多页渲染为 PNG 图像。
+    如果不指定页码范围，则默认转换全部页面。
+    渲染使用 150 DPI，在清晰度与文件大小之间取得平衡。
+
+    参数:
+        PDF文件路径: PDF 文件的绝对路径（如 "C:/文档/报告.pdf"）。
+        页码: 可选，需要转换的页码列表，页码从 1 开始计数。
+              例如 [1, 3, 5] 将转换第 1、3、5 页。
+              如果不指定此参数，则转换 PDF 的全部页面。
+        DPI: 可选，渲染分辨率，默认 150。更高值图像更清晰但文件更大。
+
+    返回:
+        图像列表，顺序与请求的页码一致。
+        每个元素为一个 Image 对象（成功时）或错误描述字符串（失败时）。
+    """
+    try:
+        # 修复 PDF 路径为空时下游报错不明确的问题。
+        if not PDF文件路径:
+            return ["错误：PDF文件路径 不能为空"]
+
+        if not os.path.isfile(PDF文件路径):
+            return [f"错误：PDF 文件不存在: {PDF文件路径}"]
+
+        输出格式 = "png"
+        实际DPI = 150 if DPI is None else max(50, min(DPI, 1200))
+
+        # 如果未指定页码，则转换全部页面
+        if 页码 is None:
+            logger.debug(f"未指定页码，将转换 PDF 全部页面: {PDF文件路径}")
+            全部结果 = _pdf全部页转图像(PDF文件路径, 输出格式, 实际DPI)
+            图像结果: List[Any] = []
+            for 条目 in 全部结果:
+                处理后图像 = await process_image_data(
+                    条目["图像字节"], 输出格式,
+                    f"{PDF文件路径} 第{条目['页码']}页", ctx
+                )
+                if 处理后图像 is not None:
+                    图像结果.append(处理后图像)
+                else:
+                    图像结果.append(f"处理第{条目['页码']}页图像失败")
+            return 图像结果
+
+        # 转换指定页面
+        图像结果 = []
+        for 单页页码 in 页码:
+            try:
+                图像字节 = _pdf单页转图像(PDF文件路径, 单页页码, 输出格式, 实际DPI)
+                处理后图像 = await process_image_data(
+                    图像字节, 输出格式,
+                    f"{PDF文件路径} 第{单页页码}页", ctx
+                )
+                if 处理后图像 is not None:
+                    图像结果.append(处理后图像)
+                else:
+                    图像结果.append(f"处理第{单页页码}页图像失败")
+            except Exception as 异常:
+                错误信息 = f"转换第{单页页码}页失败: {str(异常)}"
+                ctx.error(错误信息)
+                logger.exception(错误信息)
+                图像结果.append(错误信息)
+
+        return 图像结果
+    except Exception as 异常:
+        错误信息 = f"PDF 转图像时发生错误: {str(异常)}"
+        ctx.error(错误信息)
+        logger.exception(错误信息)
+        return [错误信息]
+
+
+def _补丁工具参数名大小写不敏感(工具函数名: str) -> None:
+    """修复 VS Code MCP 客户端将参数名中 ASCII 字符强制转为小写导致 Pydantic 校验失败的问题。
+    
+    通过给工具的 call_fn_with_arg_validation 方法添加一个包装层，
+    在校验前将传入参数名按大小写不敏感的方式映射回 Python 函数签名中的原始参数名。
+    """
+    import types as _types
+    from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata as _FuncMetadata
+
+    工具对象 = mcp._tool_manager._tools.get(工具函数名)
+    if 工具对象 is None:
+        return
+
+    arg_model = 工具对象.fn_metadata.arg_model
+    字段名列表 = list(arg_model.model_fields.keys())
+
+    # 构建 小写键 → 原始键 的映射（仅当小写后不同时才加入）
+    小写到原始: dict[str, str] = {}
+    for 名称 in 字段名列表:
+        小写名称 = 名称.lower()
+        if 小写名称 != 名称:
+            小写到原始[小写名称] = 名称
+
+    if not 小写到原始:
+        return  # 无需补丁
+
+    原始方法 = 工具对象.fn_metadata.call_fn_with_arg_validation
+
+    async def _大小写不敏感调用(
+        self: _FuncMetadata,
+        fn,
+        fn_is_async,
+        arguments_to_validate,
+        arguments_to_pass_directly,
+    ):
+        规范化参数 = {}
+        for 键, 值 in arguments_to_validate.items():
+            小写键 = 键.lower()
+            if 小写键 in 小写到原始:
+                规范化参数[小写到原始[小写键]] = 值
+            else:
+                规范化参数[键] = 值
+        return await 原始方法(fn, fn_is_async, 规范化参数, arguments_to_pass_directly)
+
+    # 修复 Pydantic FuncMetadata 不允许直接设置未注册字段的问题；绕过 Pydantic 的 __setattr__。
+    object.__setattr__(工具对象.fn_metadata, "call_fn_with_arg_validation", _types.MethodType(
+        _大小写不敏感调用, 工具对象.fn_metadata
+    ))
+
+
 def main():
     剩余命令行参数 = _解析启动参数(sys.argv[1:])
     sys.argv = [sys.argv[0], *剩余命令行参数]
+    _补丁工具参数名大小写不敏感("PDF转图像")
     mcp.run(transport='stdio')
 
 if __name__ == "__main__":

@@ -26,6 +26,9 @@ dependencies = [
     "websocket-client>=1.8.0",
 ]
 
+[project.optional-dependencies]
+pdf = ["pymupdf>=1.24.0"]
+
 [project.urls]
 Homepage = "https://github.com/Ebola-Chan-bot/mcp-images"
 Repository = "https://github.com/Ebola-Chan-bot/mcp-images"
