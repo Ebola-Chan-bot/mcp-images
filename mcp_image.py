@@ -1085,6 +1085,35 @@ def _下载wheel(url: str, 目标路径: str, 总大小: int) -> bool:
         return False
 
 
+def _安装本地wheel(wheel路径: str) -> bool:
+    """直接将 wheel 解压到 site-packages，绕过 pip/uv 子进程避免卡死。"""
+    import zipfile as _zipfile
+    import site as _site
+
+    _目标目录 = _site.getsitepackages()[0] if _site.getsitepackages() else os.path.join(sys.prefix, "Lib", "site-packages")
+    logger.info("正在安装 PyMuPDF 到 %s...", _目标目录)
+    for _h in logger.handlers:
+        _h.flush()
+
+    try:
+        with _zipfile.ZipFile(wheel路径, "r") as _zf:
+            # 跳过 .dist-info 的 RECORD 校验（路径可能不匹配）
+            _成员列表 = [m for m in _zf.infolist() if not m.is_dir()]
+            _总文件数 = len(_成员列表)
+            for _i, _成员 in enumerate(_成员列表):
+                _目标文件 = os.path.join(_目标目录, _成员.filename)
+                os.makedirs(os.path.dirname(_目标文件), exist_ok=True)
+                with _zf.open(_成员) as _源, open(_目标文件, "wb") as _目标:
+                    _目标.write(_源.read())
+                if (_i + 1) % 10 == 0 or _i == _总文件数 - 1:
+                    logger.debug("安装 PyMuPDF: %d/%d 文件", _i + 1, _总文件数)
+        logger.info("PyMuPDF 安装完成")
+        return True
+    except Exception:
+        logger.exception("解压安装 PyMuPDF 失败")
+        return False
+
+
 def _ensure_pymupdf():
     """修复 pymupdf（约 70 MB）作为必装依赖导致初始安装过大的问题；改为首次调用 PDF 功能时按需安装。"""
     global fitz
@@ -1102,35 +1131,24 @@ def _ensure_pymupdf():
         import subprocess as _subprocess
         _成功 = False
 
-        # 优先自己下载 wheel（可报告精确进度），再本地安装
+        # 策略1：自己下载 wheel 后直接解压安装（最快、可控进度、不怕子进程卡死）
         if _信息:
             _wheel路径 = os.path.join(TEMP_DIR, _信息["filename"])
             try:
                 if _下载wheel(_信息["url"], _wheel路径, _信息["size"]):
-                    _返回码 = _subprocess.call(
-                        [sys.executable, "-m", "pip", "install", "--no-deps", _wheel路径],
-                        stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
-                    )
-                    if _返回码 == 0:
+                    if _安装本地wheel(_wheel路径):
                         _成功 = True
-                    else:
-                        # pip 失败（uv 环境无 pip），回退 uv pip
-                        _返回码 = _subprocess.call(
-                            ["uv", "pip", "install", "--no-deps", _wheel路径],
-                            stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
-                        )
-                        if _返回码 == 0:
-                            _成功 = True
-                os.remove(_wheel路径)
-            except Exception:
-                pass
+            finally:
+                try:
+                    os.remove(_wheel路径)
+                except Exception:
+                    pass
 
-        # 回退：让 pip/uv 自己下载安装（无精确进度，但有守护线程汇报）
+        # 策略2：让 pip/uv 自己下载安装（回退）
         if not _成功:
+            logger.info("改用 pip 安装 PyMuPDF...")
             _返回码 = _subprocess.call([sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"])
-            if _返回码 == 0:
-                _成功 = True
-            else:
+            if _返回码 != 0:
                 _返回码 = _subprocess.call(["uv", "pip", "install", "pymupdf>=1.24.0"])
                 if _返回码 != 0:
                     raise _subprocess.CalledProcessError(_返回码, ["uv", "pip", "install", "pymupdf>=1.24.0"])
