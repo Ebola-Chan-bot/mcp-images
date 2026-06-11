@@ -28,7 +28,7 @@
 
 - 普通 PNG、JPG、WebP 等位图不依赖浏览器渲染。
 - SVG 渲染会调用 [SVG转PNG渲染器.py](SVG转PNG渲染器.py) 并通过浏览器截图生成 PNG，因此 Chromium 浏览器是 SVG 能否工作的关键前提。
-- **PDF 功能按需安装**：首次调用 `PDF转图像` 工具时，服务会自动安装 PyMuPDF（约 70 MB），无需手动预装。如果你希望提前安装，可使用 `pip install mcp-image-server[pdf]`。
+- **PDF 功能按需安装**：首次调用 `PDF转图像` 工具时，服务会自动安装 PyMuPDF（安装前联网查询实际下载大小），无需手动预装。如果你希望提前安装，可使用 `pip install mcp-image-server[pdf]`。
 
 ## 推荐启动方式
 

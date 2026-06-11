@@ -995,19 +995,50 @@ async def fetch_images(
         ctx.error(f"Failed to process images: {str(e)}")
         return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
+def _获取pymupdf下载大小() -> Optional[str]:
+    """查询 PyPI 获取 pymupdf 最新 wheel 的实际下载大小（人类可读字符串）。"""
+    import json as _json
+    from urllib.request import urlopen as _urlopen
+    from urllib.error import URLError as _URLError
+    try:
+        with _urlopen("https://pypi.org/pypi/pymupdf/json", timeout=5) as _resp:
+            _data = _json.loads(_resp.read().decode())
+        # info.urls 包含所有发布文件
+        _files = _data.get("info", {}).get("urls", []) or _data.get("urls", [])
+        for _f in _files:
+            if _f.get("packagetype") == "bdist_wheel":
+                _size = _f.get("size", 0)
+                if _size > 0:
+                    if _size >= 1_000_000:
+                        return f"{_size / 1_000_000:.0f} MB"
+                    return f"{_size / 1_000:.0f} KB"
+        return None
+    except Exception:
+        return None
+
+
 def _ensure_pymupdf():
     """修复 pymupdf（约 70 MB）作为必装依赖导致初始安装过大的问题；改为首次调用 PDF 功能时按需安装。"""
     global fitz
     try:
         import fitz
     except ImportError:
-        logger.info("首次使用 PDF 功能，正在自动安装 PyMuPDF（约 70 MB），请稍候...")
+        _大小提示 = _获取pymupdf下载大小()
+        if _大小提示:
+            logger.info("首次使用 PDF 功能，正在自动安装 PyMuPDF（约 %s），请稍候...", _大小提示)
+        else:
+            logger.info("首次使用 PDF 功能，正在自动安装 PyMuPDF，请稍候...")
         import subprocess as _subprocess
-        _subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"],
-            stdout=_subprocess.DEVNULL,
-            stderr=_subprocess.DEVNULL,
-        )
+        try:
+            # 优先尝试 pip（常规 Python 环境）；不抑制输出以显示下载进度
+            _subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"],
+            )
+        except _subprocess.CalledProcessError:
+            # 修复 uv/uvx 环境没有 pip 模块的问题：回退到 uv pip
+            _subprocess.check_call(
+                ["uv", "pip", "install", "pymupdf>=1.24.0"],
+            )
         import fitz
         logger.info("PyMuPDF 安装完成，继续处理 PDF")
 
