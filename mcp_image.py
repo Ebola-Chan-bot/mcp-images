@@ -1029,12 +1029,32 @@ def _ensure_pymupdf():
         else:
             logger.info("首次使用 PDF 功能，正在自动安装 PyMuPDF，请稍候...")
         import subprocess as _subprocess
-        # 修复管道捕获导致子进程输出缓冲、进度条不显示的问题；改用 call() 让子进程直接继承父进程 stderr。
-        _返回码 = _subprocess.call([sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"])
-        if _返回码 != 0:
-            _返回码 = _subprocess.call(["uv", "pip", "install", "pymupdf>=1.24.0"])
+        import threading as _threading
+
+        _stop = _threading.Event()
+        def _汇报进度():
+            _count = 0
+            while not _stop.wait(15):
+                _count += 1
+                logger.info("正在下载 PyMuPDF，请耐心等待...（已等待 %d 秒）", _count * 15)
+                # 修复 FileHandler 不立即刷盘导致日志文件中看不到进度的问题。
+                for _h in logger.handlers:
+                    _h.flush()
+
+        _progress_thread = _threading.Thread(target=_汇报进度, daemon=True)
+        _progress_thread.start()
+        try:
+            # 修复管道捕获和 subprocess.call 继承管道都会导致子进程输出缓冲的问题；
+            # MCP 服务器的 stderr 是管道，子进程无论怎样继承都检测到管道而切块缓冲，
+            # 因此改用守护线程定期输出下载进度提示。
+            _返回码 = _subprocess.call([sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"])
             if _返回码 != 0:
-                raise _subprocess.CalledProcessError(_返回码, ["uv", "pip", "install", "pymupdf>=1.24.0"])
+                _返回码 = _subprocess.call(["uv", "pip", "install", "pymupdf>=1.24.0"])
+                if _返回码 != 0:
+                    raise _subprocess.CalledProcessError(_返回码, ["uv", "pip", "install", "pymupdf>=1.24.0"])
+        finally:
+            _stop.set()
+            _progress_thread.join(timeout=2)
         import fitz
         logger.info("PyMuPDF 安装完成，继续处理 PDF")
 
@@ -1157,6 +1177,9 @@ async def PDF转图像(
 
         if not os.path.isfile(PDF文件路径):
             return [f"错误：PDF 文件不存在: {PDF文件路径}"]
+
+        # 修复 subprocess.call 在 async 上下文中阻塞事件循环的问题；将安装放到线程池执行。
+        await asyncio.to_thread(_ensure_pymupdf)
 
         输出格式 = "png"
         实际DPI = 150 if DPI is None else max(50, min(DPI, 1200))
