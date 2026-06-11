@@ -995,26 +995,94 @@ async def fetch_images(
         ctx.error(f"Failed to process images: {str(e)}")
         return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
-def _获取pymupdf下载大小() -> Optional[str]:
-    """查询 PyPI 获取 pymupdf 最新 wheel 的实际下载大小（人类可读字符串）。"""
+def _获取pymupdf信息() -> Optional[dict]:
+    """查询 PyPI 获取适配当前平台的 pymupdf wheel 的 URL、大小和文件名。"""
     import json as _json
+    import platform as _platform
     from urllib.request import urlopen as _urlopen
-    from urllib.error import URLError as _URLError
+
+    _机器 = _platform.machine().lower()
+    _系统 = sys.platform
+
+    # 根据当前平台构建候选 platform_tag 列表，按优先级排序
+    if _系统 == "win32":
+        _候选标签 = ["win_amd64", "win32"] if _机器 in ("amd64", "x86_64") else ["win32"]
+    elif _系统 == "darwin":
+        _候选标签 = ["macosx_11_0_arm64", "macosx_10_9_x86_64"] if _机器 == "arm64" else ["macosx_10_9_x86_64"]
+    else:
+        _候选标签 = ["manylinux_2_28_x86_64", "musllinux_1_2_x86_64", "manylinux_2_28_aarch64"]
+
     try:
         with _urlopen("https://pypi.org/pypi/pymupdf/json", timeout=5) as _resp:
             _data = _json.loads(_resp.read().decode())
-        # info.urls 包含所有发布文件
-        _files = _data.get("info", {}).get("urls", []) or _data.get("urls", [])
+        _files = _data.get("urls", []) or _data.get("info", {}).get("urls", [])
+
+        for _标签 in _候选标签:
+            for _f in _files:
+                if _f.get("packagetype") == "bdist_wheel" and _标签 in _f.get("filename", ""):
+                    _size = _f.get("size", 0)
+                    _url = _f.get("url", "")
+                    _filename = _f.get("filename", "")
+                    if _size > 0 and _url:
+                        return {"url": _url, "size": _size, "filename": _filename}
+
+        # 无精确匹配时取任意 wheel（回退用，安装可能失败但由 pip 兜底）
         for _f in _files:
             if _f.get("packagetype") == "bdist_wheel":
                 _size = _f.get("size", 0)
-                if _size > 0:
-                    if _size >= 1_000_000:
-                        return f"{_size / 1_000_000:.0f} MB"
-                    return f"{_size / 1_000:.0f} KB"
+                _url = _f.get("url", "")
+                _filename = _f.get("filename", "")
+                if _size > 0 and _url:
+                    return {"url": _url, "size": _size, "filename": _filename}
         return None
     except Exception:
         return None
+
+
+def _格式化大小(字节数: int) -> str:
+    if 字节数 >= 1_000_000:
+        return f"{字节数 / 1_000_000:.2f} MB"
+    if 字节数 >= 1_000:
+        return f"{字节数 / 1_000:.1f} KB"
+    return f"{字节数} B"
+
+
+def _下载wheel(url: str, 目标路径: str, 总大小: int) -> bool:
+    """用 httpx 流式下载 wheel，实时报告已下载/总大小/速度。返回是否成功。"""
+    try:
+        import httpx as _httpx
+        _开始时间 = time.time()
+        _已下载 = 0
+        _上次报告时间 = 0.0
+
+        with _httpx.Client(follow_redirects=True, timeout=_httpx.Timeout(600, connect=30)) as _client:
+            with _client.stream("GET", url) as _resp:
+                _resp.raise_for_status()
+                with open(目标路径, "wb") as _f:
+                    for _块 in _resp.iter_bytes(chunk_size=8192):
+                        _f.write(_块)
+                        _已下载 += len(_块)
+                        _现在 = time.time()
+                        # 每 5 秒报告一次进度
+                        if _现在 - _上次报告时间 >= 5:
+                            _耗时 = _现在 - _开始时间
+                            _速度 = _已下载 / _耗时 if _耗时 > 0 else 0
+                            _百分比 = _已下载 / 总大小 * 100 if 总大小 > 0 else 0
+                            logger.info(
+                                "下载 PyMuPDF: %s / %s (%.0f%%)，速度 %s/s",
+                                _格式化大小(_已下载), _格式化大小(总大小), _百分比, _格式化大小(int(_速度)),
+                            )
+                            for _h in logger.handlers:
+                                _h.flush()
+                            _上次报告时间 = _现在
+
+        _总耗时 = time.time() - _开始时间
+        _平均速度 = _已下载 / _总耗时 if _总耗时 > 0 else 0
+        logger.info("PyMuPDF 下载完成: %s，耗时 %.0f 秒，平均速度 %s/s", _格式化大小(_已下载), _总耗时, _格式化大小(int(_平均速度)))
+        return True
+    except Exception:
+        logger.exception("下载 PyMuPDF wheel 失败")
+        return False
 
 
 def _ensure_pymupdf():
@@ -1023,38 +1091,50 @@ def _ensure_pymupdf():
     try:
         import fitz
     except ImportError:
-        _大小提示 = _获取pymupdf下载大小()
-        if _大小提示:
-            logger.info("首次使用 PDF 功能，正在自动安装 PyMuPDF（约 %s），请稍候...", _大小提示)
+        _信息 = _获取pymupdf信息()
+        if _信息:
+            logger.info("首次使用 PDF 功能，正在安装 PyMuPDF（%s）...", _格式化大小(_信息["size"]))
         else:
-            logger.info("首次使用 PDF 功能，正在自动安装 PyMuPDF，请稍候...")
+            logger.info("首次使用 PDF 功能，正在安装 PyMuPDF...")
+        for _h in logger.handlers:
+            _h.flush()
+
         import subprocess as _subprocess
-        import threading as _threading
+        _成功 = False
 
-        _stop = _threading.Event()
-        def _汇报进度():
-            _count = 0
-            while not _stop.wait(15):
-                _count += 1
-                logger.info("正在下载 PyMuPDF，请耐心等待...（已等待 %d 秒）", _count * 15)
-                # 修复 FileHandler 不立即刷盘导致日志文件中看不到进度的问题。
-                for _h in logger.handlers:
-                    _h.flush()
+        # 优先自己下载 wheel（可报告精确进度），再本地安装
+        if _信息:
+            _wheel路径 = os.path.join(TEMP_DIR, _信息["filename"])
+            try:
+                if _下载wheel(_信息["url"], _wheel路径, _信息["size"]):
+                    _返回码 = _subprocess.call(
+                        [sys.executable, "-m", "pip", "install", "--no-deps", _wheel路径],
+                        stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+                    )
+                    if _返回码 == 0:
+                        _成功 = True
+                    else:
+                        # pip 失败（uv 环境无 pip），回退 uv pip
+                        _返回码 = _subprocess.call(
+                            ["uv", "pip", "install", "--no-deps", _wheel路径],
+                            stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+                        )
+                        if _返回码 == 0:
+                            _成功 = True
+                os.remove(_wheel路径)
+            except Exception:
+                pass
 
-        _progress_thread = _threading.Thread(target=_汇报进度, daemon=True)
-        _progress_thread.start()
-        try:
-            # 修复管道捕获和 subprocess.call 继承管道都会导致子进程输出缓冲的问题；
-            # MCP 服务器的 stderr 是管道，子进程无论怎样继承都检测到管道而切块缓冲，
-            # 因此改用守护线程定期输出下载进度提示。
+        # 回退：让 pip/uv 自己下载安装（无精确进度，但有守护线程汇报）
+        if not _成功:
             _返回码 = _subprocess.call([sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"])
-            if _返回码 != 0:
+            if _返回码 == 0:
+                _成功 = True
+            else:
                 _返回码 = _subprocess.call(["uv", "pip", "install", "pymupdf>=1.24.0"])
                 if _返回码 != 0:
                     raise _subprocess.CalledProcessError(_返回码, ["uv", "pip", "install", "pymupdf>=1.24.0"])
-        finally:
-            _stop.set()
-            _progress_thread.join(timeout=2)
+
         import fitz
         logger.info("PyMuPDF 安装完成，继续处理 PDF")
 
