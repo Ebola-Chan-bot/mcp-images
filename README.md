@@ -43,19 +43,19 @@ pip install --user uv
 然后直接启动服务：
 
 ```bash
-uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 mcp-image-server
+uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.0 mcp-image-server
 ```
 
 如果你要确保服务使用指定浏览器或指定 emoji 字体，可以在启动时显式传入参数：
 
 ```bash
-uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 mcp-image-server --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --表情字体路径 "C:\Windows\Fonts\seguiemj.ttf"
+uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.0 mcp-image-server --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --表情字体路径 "C:\Windows\Fonts\seguiemj.ttf"
 ```
 
 如果你希望把命令安装到本机，也可以使用：
 
 ```bash
-uv tool install --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 mcp-image-server
+uv tool install --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.0 mcp-image-server
 ```
 
 安装后可直接运行：
@@ -64,7 +64,7 @@ uv tool install --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 m
 mcp-image-server
 ```
 
-升级到新版本时，把命令中的 `@v1.0.0` 替换成新的发布 tag 即可。
+升级到新版本时，把命令中的 `@v1.1.0` 替换成新的发布 tag 即可。
 
 本地开发或调试时，才需要在仓库目录中直接运行源码。
 
@@ -102,7 +102,7 @@ mcp-image-server
   "servers": {
     "image-service": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0", "mcp-image-server"]
+      "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.0", "mcp-image-server"]
     }
   },
   "inputs": []
@@ -118,7 +118,7 @@ mcp-image-server
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0",
+        "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.0",
         "mcp-image-server",
         "--浏览器路径",
         "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
@@ -136,7 +136,7 @@ mcp-image-server
 其他 MCP 客户端可参考以下原则配置：
 
 - `command` 使用 `uvx`
-- `args` 使用 `--from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.0.0 mcp-image-server`
+- `args` 使用 `--from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.0 mcp-image-server`
 - 如果需要，再额外追加 `--浏览器路径` 和 `--表情字体路径`
 
 ## 可用工具
