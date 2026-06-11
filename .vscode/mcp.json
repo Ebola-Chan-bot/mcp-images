@@ -1,8 +1,12 @@
 {
 	"servers": {
 		"image-service": {
-			"command": "python",
-			"args": ["${workspaceFolder}\\mcp_image.py"]
+			"command": "uvx",
+			"args": [
+				"--from",
+				"git+https://github.com/Ebola-Chan-bot/mcp-images",
+				"mcp-image-server"
+			]
 		}
 	},
 	"inputs": []
