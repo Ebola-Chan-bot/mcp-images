@@ -1017,6 +1017,45 @@ def _获取pymupdf下载大小() -> Optional[str]:
         return None
 
 
+def _安装并记录(命令: list) -> int:
+    """运行安装命令，将输出逐行 relay 到 logger 和 stderr（供 VS Code 输出面板显示）。
+    
+    进度刷新行（含 \\r）每 5 秒最多记一条，避免日志刷屏。
+    """
+    import subprocess as _sp
+    _进程 = _sp.Popen(命令, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, encoding="utf-8", errors="replace")
+    assert _进程.stdout is not None
+    _上次进度日志 = 0.0
+    _残留 = ""
+    while True:
+        _块 = _进程.stdout.read(4096)
+        if not _块:
+            break
+        # 修复进度行不以 \\n 结尾导致 for-line 迭代丢失最后一行的问题。
+        _行列表 = (_残留 + _块).split("\n")
+        _残留 = _行列表.pop()  # 最后一段可能不完整，留到下次
+        for _行 in _行列表:
+            _行 = _行.rstrip("\r")
+            if not _行:
+                continue
+            print(_行, file=sys.stderr)  # 透传到 VS Code 输出面板
+            if "\r" in _行:
+                _现在 = time.time()
+                if _现在 - _上次进度日志 >= 5:
+                    logger.debug(_行.split("\r")[-1])
+                    _上次进度日志 = _现在
+            else:
+                logger.debug(_行)
+    # 处理最后残留的片段
+    if _残留:
+        _残留 = _残留.rstrip("\r")
+        if _残留:
+            print(_残留, file=sys.stderr)
+            logger.debug(_残留)
+    _进程.wait()
+    return _进程.returncode
+
+
 def _ensure_pymupdf():
     """修复 pymupdf（约 70 MB）作为必装依赖导致初始安装过大的问题；改为首次调用 PDF 功能时按需安装。"""
     global fitz
@@ -1029,16 +1068,12 @@ def _ensure_pymupdf():
         else:
             logger.info("首次使用 PDF 功能，正在自动安装 PyMuPDF，请稍候...")
         import subprocess as _subprocess
-        try:
-            # 优先尝试 pip（常规 Python 环境）；不抑制输出以显示下载进度
-            _subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"],
-            )
-        except _subprocess.CalledProcessError:
+        _返回码 = _安装并记录([sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"])
+        if _返回码 != 0:
             # 修复 uv/uvx 环境没有 pip 模块的问题：回退到 uv pip
-            _subprocess.check_call(
-                ["uv", "pip", "install", "pymupdf>=1.24.0"],
-            )
+            _返回码 = _安装并记录(["uv", "pip", "install", "pymupdf>=1.24.0"])
+            if _返回码 != 0:
+                raise _subprocess.CalledProcessError(_返回码, ["uv", "pip", "install", "pymupdf>=1.24.0"])
         import fitz
         logger.info("PyMuPDF 安装完成，继续处理 PDF")
 
