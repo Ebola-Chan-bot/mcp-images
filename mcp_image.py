@@ -11,6 +11,9 @@ import socket
 import argparse
 import tempfile
 import subprocess
+import importlib.util
+import threading
+import urllib.request
 import httpx
 import logging
 from io import BytesIO
@@ -22,9 +25,116 @@ from mcp.server.fastmcp import FastMCP, Image, Context
 from typing import List, Dict, Any, Optional
 from xml.etree import ElementTree
 
-TEMP_DIR = "./Temp"
-DATA_DIR = "./data"
+_当前文件目录 = os.path.dirname(os.path.abspath(__file__))
+TEMP_DIR = os.path.join(_当前文件目录, "Temp")
+DATA_DIR = os.path.join(_当前文件目录, "data")
 CDP渲染脚本路径 = os.path.join(os.path.dirname(__file__), "SVG转PNG渲染器.py")
+
+# 持久化 headless Edge 进程，避免每次 SVG 渲染都启动/销毁浏览器
+_持久Edge进程: Optional[subprocess.Popen] = None
+_持久Edge端口: int = 0
+_持久Edge配置: str = ""
+_渲染器模块: Any = None
+_Edge启动锁 = threading.Lock()
+
+
+def _加载渲染器模块() -> Any:
+    """懒加载 SVG转PNG渲染器 模块，供 CDP 渲染直接调用。"""
+    global _渲染器模块
+    if _渲染器模块 is None:
+        spec = importlib.util.spec_from_file_location("svg_renderer", CDP渲染脚本路径)
+        _渲染器模块 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_渲染器模块)
+    return _渲染器模块
+
+
+def _获取或启动持久Edge() -> tuple[int, str]:
+    """返回 (调试端口, 配置目录)。跨进程复用：通过锁文件记录端口并探测存活性。
+    若锁文件不可用则重启 Edge 到同一持久 profile。"""
+    global _持久Edge进程, _持久Edge端口, _持久Edge配置
+
+    if not _持久Edge配置:
+        _持久Edge配置 = os.path.abspath(os.path.join(DATA_DIR, "edge-profile"))
+
+    os.makedirs(_持久Edge配置, exist_ok=True)
+    锁文件 = os.path.join(_持久Edge配置, ".mcp.lock")
+
+    # 内存中已有有效端口 → 直接复用（同进程内最快路径）
+    if _持久Edge端口:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{_持久Edge端口}/json/version", timeout=2
+            ) as resp:
+                if resp.status == 200:
+                    return _持久Edge端口, _持久Edge配置
+        except Exception:
+            _持久Edge端口 = 0
+
+    # 从锁文件恢复（跨进程复用）
+    if os.path.isfile(锁文件):
+        try:
+            with open(锁文件, "r") as fh:
+                锁数据 = json.loads(fh.read())
+            恢复端口 = int(锁数据["端口"])
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{恢复端口}/json/version", timeout=2
+            ) as resp:
+                if resp.status == 200:
+                    _持久Edge端口 = 恢复端口
+                    return 恢复端口, _持久Edge配置
+        except Exception:
+            pass
+
+    # 不可复用 → 加锁后重新探测（避免并发时多个线程同时重建）
+    with _Edge启动锁:
+        # 再次探测：可能已被其他线程启动
+        if _持久Edge端口:
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{_持久Edge端口}/json/version", timeout=2
+                ) as resp:
+                    if resp.status == 200:
+                        return _持久Edge端口, _持久Edge配置
+            except Exception:
+                _持久Edge端口 = 0
+        if os.path.isfile(锁文件):
+            try:
+                with open(锁文件, "r") as fh:
+                    锁数据 = json.loads(fh.read())
+                恢复端口 = int(锁数据["端口"])
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{恢复端口}/json/version", timeout=2
+                ) as resp:
+                    if resp.status == 200:
+                        _持久Edge端口 = 恢复端口
+                        return 恢复端口, _持久Edge配置
+            except Exception:
+                pass
+
+        # 删锁文件（旧进程已不可用），启动新 Edge
+        try:
+            os.remove(锁文件)
+        except Exception:
+            pass
+
+        svg = _加载渲染器模块()
+        浏览器 = 解析SVG浏览器路径()
+        _持久Edge端口 = _获取空闲TCP端口()
+        启动参数 = svg.构建浏览器启动参数()
+        命令 = svg.构建Edge命令(浏览器, _持久Edge端口, _持久Edge配置)
+
+        _持久Edge进程 = subprocess.Popen(命令, **启动参数)
+        svg.等待JSON(f"http://127.0.0.1:{_持久Edge端口}/json/version", timeout_ms=20000)
+
+        try:
+            with open(锁文件, "w") as fh:
+                json.dump({"端口": _持久Edge端口}, fh)
+        except Exception:
+            pass
+
+    return _持久Edge端口, _持久Edge配置
+
+
 # 修复启动参数与环境变量名称不一致的问题；优先使用与参数同名的环境变量，并兼容旧名称。
 SVG浏览器环境变量 = ("浏览器路径", "MCP图片浏览器路径")
 SVG表情字体环境变量 = ("表情字体路径", "MCP图片表情字体路径")
@@ -360,81 +470,19 @@ def 通过CDP渲染SVG到PNG(
         raise FileNotFoundError(f"未找到 CDP 渲染脚本: {CDP渲染脚本路径}")
 
     目标宽度, 目标高度 = _获取SVG目标尺寸(svg_data, svg_dpi)
-    调试端口 = _获取空闲TCP端口()
+    端口, 配置目录 = _获取或启动持久Edge()
 
     with tempfile.TemporaryDirectory(prefix="svg-cdp-", dir=TEMP_DIR) as 工作目录:
         包装页路径 = os.path.join(工作目录, "wrapper.html")
-        PNG输出路径 = os.path.join(工作目录, "rendered.png")
-        报告路径 = os.path.join(工作目录, "render-report.json")
-        状态路径 = os.path.join(工作目录, "render-status.json")
-        浏览器配置目录 = os.path.join(工作目录, "profile")
         SVG文本 = svg_data.decode("utf-8", errors="replace")
         HTML文本 = _构建SVG包装HTML(SVG文本, 目标宽度, 目标高度, 表情字体文件)
         with open(包装页路径, "w", encoding="utf-8") as handle:
             handle.write(HTML文本)
 
-        命令 = [
-            sys.executable,
-            CDP渲染脚本路径,
-            浏览器可执行文件,
-            Path(包装页路径).resolve().as_uri(),
-            PNG输出路径,
-            报告路径,
-            状态路径,
-            浏览器配置目录,
-            str(调试端口),
-            str(目标宽度),
-            str(目标高度),
-        ]
-        # 修复大 SVG 在 CDP 截图阶段只能盲等子进程退出，父进程无法区分慢渲染和卡死的问题。
-        渲染进程 = subprocess.Popen(
-            命令,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-        )
-        开始时间 = time.time()
-        上次状态时间戳 = None
-        最近状态描述 = "尚未收到状态"
-
-        while 渲染进程.poll() is None:
-            if os.path.isfile(状态路径):
-                try:
-                    with open(状态路径, "r", encoding="utf-8") as 状态文件:
-                        当前状态 = json.load(状态文件)
-                    最近状态描述 = 当前状态.get("阶段", 最近状态描述)
-                    上次状态时间戳 = 当前状态.get("时间戳", 上次状态时间戳)
-                except Exception:
-                    pass
-
-            已等待秒数 = time.time() - 开始时间
-            if 已等待秒数 > 240:
-                渲染进程.kill()
-                标准输出, 标准错误 = 渲染进程.communicate()
-                raise RuntimeError(
-                    f"CDP 渲染超时；最近状态：{最近状态描述}；标准错误：{(标准错误 or 标准输出 or '无')[:500]}"
-                )
-
-            if 上次状态时间戳 and time.time() - 上次状态时间戳 > 30:
-                渲染进程.kill()
-                标准输出, 标准错误 = 渲染进程.communicate()
-                raise RuntimeError(
-                    f"CDP 渲染状态心跳已停止；最近状态：{最近状态描述}；标准错误：{(标准错误 or 标准输出 or '无')[:500]}"
-                )
-
-            time.sleep(0.5)
-
-        标准输出, 标准错误 = 渲染进程.communicate()
-        if 渲染进程.returncode != 0:
-            失败详情 = (标准错误 or 标准输出 or "CDP 渲染失败").strip()
-            raise RuntimeError(失败详情)
-        if not os.path.isfile(PNG输出路径):
-            raise RuntimeError("CDP 渲染器未生成输出 PNG")
-
-        with open(PNG输出路径, "rb") as handle:
-            return handle.read()
+        url = Path(包装页路径).resolve().as_uri()
+        svg = _加载渲染器模块()
+        png_data = svg.内联CDP渲染(浏览器可执行文件, url, 目标宽度, 目标高度, 端口, 配置目录)
+        return png_data
 
 
 def _解析启动参数(argv: Optional[List[str]] = None) -> List[str]:

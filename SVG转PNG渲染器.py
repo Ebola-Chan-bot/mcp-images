@@ -132,6 +132,129 @@ def 构建浏览器启动参数() -> dict:
     return 启动参数
 
 
+def 构建Edge命令(浏览器路径: str, 端口: int, 配置目录: str) -> list:
+    """构建 headless Edge 的命令行参数，供测试与正式渲染共用。
+    默认将窗口移出屏幕，设置环境变量 MCP_IMAGE_NO_WINDOW_HIDE=1 可使窗口保留在屏幕内以便调试。"""
+    命令 = [
+        浏览器路径,
+        "--hide-scrollbars",
+        "--force-device-scale-factor=1",
+        "--remote-allow-origins=*",
+        f"--remote-debugging-port={端口}",
+        f"--user-data-dir={配置目录}",
+        "about:blank",
+    ]
+    # 修复 GPU 合成器主窗口在启动瞬间闪现的问题：默认将窗口移出屏幕
+    if os.environ.get("MCP_IMAGE_NO_WINDOW_HIDE", "").strip().lower() not in ("1", "true", "yes"):
+        命令.insert(1, "--window-position=-32000,-32000")
+    return 命令
+
+
+def 内联CDP渲染(浏览器路径: str, 页面URL: str, 宽度: int, 高度: int,
+               端口: int, 配置目录: str) -> bytes:
+    """
+    通过 CDP Target.createTarget 创建独立标签页渲染，可安全并发。
+    每次调用创建新标签页，渲染完成后自动关闭该标签页。
+    """
+    Path(配置目录).mkdir(parents=True, exist_ok=True)
+
+    # 获取浏览器级 WebSocket URL
+    版本信息 = 等待JSON(f"http://127.0.0.1:{端口}/json/version", timeout_ms=10000)
+    browser_ws = 版本信息.get("webSocketDebuggerUrl", "")
+    if not browser_ws:
+        raise RuntimeError("无法获取浏览器 WebSocket URL")
+
+    # 创建独立标签页
+    browser = CDP客户端(browser_ws)
+    目标ID = None
+    try:
+        新目标 = browser.发送("Target.createTarget", {
+            "url": "about:blank",
+        })
+        目标ID = 新目标["targetId"]
+    finally:
+        browser.关闭()
+
+    # 等待目标就绪（轮询直到 webSocketDebuggerUrl 出现）
+    页面目标 = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            列表 = 等待JSON(f"http://127.0.0.1:{端口}/json/list", timeout_ms=2000)
+            for t in 列表:
+                if t.get("id") == 目标ID and t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                    页面目标 = t
+                    break
+        except Exception:
+            pass
+        if 页面目标:
+            break
+        睡眠毫秒(100)
+    if not 页面目标:
+        raise RuntimeError(f"无法找到目标 {目标ID}")
+
+    # 在新标签页上 CDP 渲染
+    ws_url = 页面目标["webSocketDebuggerUrl"]
+    客户端 = CDP客户端(ws_url)
+    try:
+        客户端.发送("Page.enable")
+        客户端.发送("Runtime.enable")
+        客户端.发送(
+            "Emulation.setDefaultBackgroundColorOverride",
+            {"color": {"r": 0, "g": 0, "b": 0, "a": 0}},
+        )
+        客户端.发送("Page.navigate", {"url": 页面URL})
+        客户端.等待事件("Page.loadEventFired")
+        睡眠毫秒(300)
+
+        客户端.发送("Runtime.evaluate", {
+            "expression": (
+                "(() => {"
+                "const svg = document.querySelector('svg');"
+                "if (!svg) { throw new Error('包装页中不存在 SVG 元素'); }"
+                "document.documentElement.style.margin = '0';"
+                f"document.documentElement.style.width = '{宽度}px';"
+                f"document.documentElement.style.height = '{高度}px';"
+                "document.documentElement.style.background = 'transparent';"
+                "document.body.style.margin = '0';"
+                f"document.body.style.width = '{宽度}px';"
+                f"document.body.style.height = '{高度}px';"
+                "document.body.style.background = 'transparent';"
+                "svg.style.display = 'block';"
+                f"svg.style.width = '{宽度}px';"
+                f"svg.style.height = '{高度}px';"
+                "svg.style.overflow = 'visible';"
+                "const rect = svg.getBoundingClientRect();"
+                "return JSON.stringify({ x: rect.x, y: rect.y, width: rect.width, height: rect.height });"
+                "})()"
+            ),
+            "returnByValue": True,
+        })
+
+        客户端.发送("Emulation.setDeviceMetricsOverride", {
+            "width": 宽度, "height": 高度,
+            "deviceScaleFactor": 1, "mobile": False, "scale": 1,
+        })
+
+        截图结果 = 客户端.发送("Page.captureScreenshot", {
+            "format": "png", "fromSurface": True, "captureBeyondViewport": True,
+            "clip": {"x": 0, "y": 0, "width": 宽度, "height": 高度, "scale": 1},
+        }, timeout_ms=180000)
+        return base64.b64decode(截图结果["data"])
+    finally:
+        客户端.关闭()
+        # 关闭标签页
+        if 目标ID:
+            try:
+                b = CDP客户端(browser_ws)
+                try:
+                    b.发送("Target.closeTarget", {"targetId": 目标ID}, timeout_ms=5000)
+                finally:
+                    b.关闭()
+            except Exception:
+                pass
+
+
 def main() -> int:
     参数列表 = sys.argv[1:]
     if len(参数列表) != 9:
@@ -151,125 +274,24 @@ def main() -> int:
     写入状态文件(状态路径, "准备启动浏览器", 端口=端口, 宽度=宽度, 高度=高度)
 
     浏览器进程 = subprocess.Popen(
-        [
-            浏览器路径,
-            "--headless",
-            "--disable-gpu",
-            "--hide-scrollbars",
-            "--force-device-scale-factor=1",
-            # 修复新版 Chromium 默认拒绝本地 CDP WebSocket 握手导致 SVG 渲染长时间无返回的问题。
-            "--remote-allow-origins=*",
-            f"--remote-debugging-port={端口}",
-            f"--user-data-dir={配置目录}",
-            "about:blank",
-        ],
+        构建Edge命令(浏览器路径, 端口, 配置目录),
         **构建浏览器启动参数(),
     )
 
     客户端 = None
     try:
-        目标列表 = 等待JSON(f"http://127.0.0.1:{端口}/json/list")
-        写入状态文件(状态路径, "浏览器调试端点就绪", 目标数量=len(目标列表))
-        页面目标 = next((target for target in 目标列表 if target.get("type") == "page"), None)
-        if not 页面目标:
-            raise RuntimeError("没有可用的页面目标")
-
-        客户端 = CDP客户端(页面目标["webSocketDebuggerUrl"])
-        写入状态文件(状态路径, "已连接CDP")
-        客户端.发送("Page.enable")
-        客户端.发送("Runtime.enable")
-        # 修复 SVG 渲染强制依赖 Node.js 才能驱动 CDP 的问题。
-        客户端.发送(
-            "Emulation.setDefaultBackgroundColorOverride",
-            {"color": {"r": 0, "g": 0, "b": 0, "a": 0}},
-        )
-
-        客户端.发送("Page.navigate", {"url": 页面URL})
-        客户端.等待事件("Page.loadEventFired")
-        写入状态文件(状态路径, "页面加载完成")
-        睡眠毫秒(300)
-
-        布局结果 = 客户端.发送(
-            "Runtime.evaluate",
-            {
-                "expression": (
-                    "(() => {"
-                    "const svg = document.querySelector('svg');"
-                    "if (!svg) { throw new Error('包装页中不存在 SVG 元素'); }"
-                    "document.documentElement.style.margin = '0';"
-                    f"document.documentElement.style.width = '{宽度}px';"
-                    f"document.documentElement.style.height = '{高度}px';"
-                    "document.documentElement.style.background = 'transparent';"
-                    "document.body.style.margin = '0';"
-                    f"document.body.style.width = '{宽度}px';"
-                    f"document.body.style.height = '{高度}px';"
-                    "document.body.style.background = 'transparent';"
-                    "svg.style.display = 'block';"
-                    f"svg.style.width = '{宽度}px';"
-                    f"svg.style.height = '{高度}px';"
-                    "svg.style.overflow = 'visible';"
-                    "const rect = svg.getBoundingClientRect();"
-                    "return JSON.stringify({ x: rect.x, y: rect.y, width: rect.width, height: rect.height });"
-                    "})()"
-                ),
-                "returnByValue": True,
-            },
-        )
-        渲染矩形 = json.loads(布局结果["result"]["value"])
-        写入状态文件(状态路径, "布局计算完成", 矩形=渲染矩形)
-
-        客户端.发送(
-            "Emulation.setDeviceMetricsOverride",
-            {
-                "width": 宽度,
-                "height": 高度,
-                "deviceScaleFactor": 1,
-                "mobile": False,
-                "scale": 1,
-            },
-        )
-
-        截图开始时间 = time.time()
-
-        def 截图心跳() -> None:
-            已等待秒数 = round(time.time() - 截图开始时间, 2)
-            写入状态文件(
-                状态路径,
-                "等待截图返回",
-                已等待秒数=已等待秒数,
-                浏览器仍在运行=浏览器进程.poll() is None,
-                调试端点可达=调试端点可达(端口),
-            )
-
-        截图结果 = 客户端.发送(
-            "Page.captureScreenshot",
-            {
-                "format": "png",
-                "fromSurface": True,
-                "captureBeyondViewport": True,
-                "clip": {
-                    "x": 0,
-                    "y": 0,
-                    "width": 宽度,
-                    "height": 高度,
-                    "scale": 1,
-                },
-            },
-            timeout_ms=180000,
-            心跳间隔_ms=2000,
-            心跳回调=截图心跳,
-        )
+        写入状态文件(状态路径, "浏览器调试端点就绪")
+        png_data = 内联CDP渲染(浏览器路径, 页面URL, 宽度, 高度, 端口, 配置目录)
         写入状态文件(状态路径, "截图完成")
 
         with open(输出路径, "wb") as 文件句柄:
-            文件句柄.write(base64.b64decode(截图结果["data"]))
+            文件句柄.write(png_data)
 
         报告内容 = {
             "浏览器路径": 浏览器路径,
             "页面URL": 页面URL,
             "输出路径": 输出路径,
             "目标CSS像素": {"宽度": 宽度, "高度": 高度},
-            "调整后矩形": 渲染矩形,
             "实际PNG尺寸": 读取PNG尺寸(输出路径),
         }
         with open(报告路径, "w", encoding="utf-8") as 文件句柄:
