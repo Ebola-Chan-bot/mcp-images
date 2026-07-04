@@ -134,7 +134,9 @@ def 构建浏览器启动参数() -> dict:
 
 def 构建Edge命令(浏览器路径: str, 端口: int, 配置目录: str) -> list:
     """构建 headless Edge 的命令行参数，供测试与正式渲染共用。
-    默认将窗口移出屏幕，设置环境变量 MCP_IMAGE_NO_WINDOW_HIDE=1 可使窗口保留在屏幕内以便调试。"""
+    默认使用 --headless 不创建桌面窗口（无任务栏图标），同时配合 --window-position
+    将窗口移出屏幕作为双重保险。设置环境变量 MCP_IMAGE_NO_WINDOW_HIDE=1
+    可去除 headless 并将窗口保留在屏幕内以便调试。"""
     命令 = [
         浏览器路径,
         "--hide-scrollbars",
@@ -144,9 +146,14 @@ def 构建Edge命令(浏览器路径: str, 端口: int, 配置目录: str) -> li
         f"--user-data-dir={配置目录}",
         "about:blank",
     ]
-    # 修复 GPU 合成器主窗口在启动瞬间闪现的问题：默认将窗口移出屏幕
-    if os.environ.get("MCP_IMAGE_NO_WINDOW_HIDE", "").strip().lower() not in ("1", "true", "yes"):
-        命令.insert(1, "--window-position=-32000,-32000")
+    if os.environ.get("MCP_IMAGE_NO_WINDOW_HIDE", "").strip().lower() in ("1", "true", "yes"):
+        # 调试模式：去除 headless，窗口留在屏幕内可观察
+        pass
+    else:
+        # 正常模式：headless 不创建桌面窗口 → 无任务栏图标、无窗口闪现
+        命令.insert(1, "--headless")
+        # 双重保险：万一 headless 在特定版本上不完全生效，窗口也移出屏幕
+        命令.insert(2, "--window-position=-32000,-32000")
     return 命令
 
 

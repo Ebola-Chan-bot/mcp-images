@@ -7,7 +7,7 @@
 				"mcp_image"
 			],
 			"env": {
-				"MCP_IMAGE_NO_WINDOW_HIDE": "1"
+				"MCP_IMAGE_NO_WINDOW_HIDE": "0"
 			}
 		}
 	},
