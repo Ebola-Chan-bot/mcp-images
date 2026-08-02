@@ -21,7 +21,8 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.28.1",
-    "mcp[cli]>=1.2.1",
+    # 代码已迁移到 mcp 2.0 的 mcp.server.mcpserver API，1.x 无此子包，必须 >=2.0.0。
+    "mcp[cli]>=2.0.0",
     "pillow>=11.1.0",
     "websocket-client>=1.8.0",
 ]

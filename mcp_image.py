@@ -21,7 +21,8 @@ from datetime import datetime
 from PIL import Image as PILImage
 from pathlib import Path
 from urllib.parse import urlparse
-from mcp.server.fastmcp import FastMCP, Image, Context
+# 修复 mcp 2.0 移除 mcp.server.fastmcp 导致的 ModuleNotFoundError；迁移到新的 mcpserver 高层 API。
+from mcp.server.mcpserver import MCPServer, Image, Context
 from typing import List, Dict, Any, Optional
 from xml.etree import ElementTree
 
@@ -523,13 +524,13 @@ async def _处理SVG字节(
         return {"image": 处理后图片}
     except Exception as exc:
         错误信息 = f"转换 SVG {image_source} 时出错: {str(exc)}"
-        ctx.error(错误信息)
+        await ctx.error(错误信息)
         logger.exception(错误信息)
         return {"error": 错误信息}
 
 
-# Create a FastMCP server instance
-mcp = FastMCP("image-service")
+# Create an MCP server instance（mcp 2.0 中 FastMCP 已更名为 MCPServer）
+mcp = MCPServer("image-service")
 
 async def process_image_data(data: bytes, content_type: str, image_source: str, ctx: Context) -> Image | None:
     """Process image data and return an MCP Image object."""
@@ -619,17 +620,17 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                         # Then try scaling down
                         scale_factor *= 0.8
                         if current_width * scale_factor < 200 or current_height * scale_factor < 200:
-                            ctx.error("Unable to compress image to acceptable size while maintaining quality")
+                            await ctx.error("Unable to compress image to acceptable size while maintaining quality")
                             logger.error(f"Failed processing image from {image_source}: dimensions too small")
                             return None
                         logger.debug(f"Applying scale factor {scale_factor} to image from {image_source}")
                         quality = 85  # Reset quality when changing size
         except MemoryError as e:
-            ctx.error(f"Out of memory processing large image: {str(e)}")
+            await ctx.error(f"Out of memory processing large image: {str(e)}")
             logger.error(f"MemoryError processing image from {image_source}: {str(e)}")
             return None
         except Exception as e:
-            ctx.error(f"Image processing error: {str(e)}")
+            await ctx.error(f"Image processing error: {str(e)}")
             logger.exception(f"Exception processing image from {image_source}")
             return None
         finally:
@@ -637,7 +638,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                 os.remove(temp_path)
                 
     except Exception as e:
-        ctx.error(f"Error processing image: {str(e)}")
+        await ctx.error(f"Error processing image: {str(e)}")
         logger.exception(f"Unexpected error processing {image_source}")
         return None
 
@@ -652,7 +653,7 @@ async def process_local_image(
     try:
         if not os.path.exists(file_path):
             error_msg = f"File not found: {file_path}"
-            ctx.error(error_msg)
+            await ctx.error(error_msg)
             logger.error(error_msg)
             return {"path": file_path, "error": error_msg}
         
@@ -677,7 +678,7 @@ async def process_local_image(
                 return SVG处理结果
             except Exception as e:
                 error_msg = f"转换 SVG {file_path} 时出错: {str(e)}"
-                ctx.error(error_msg)
+                await ctx.error(error_msg)
                 logger.exception(error_msg)
                 return {"path": file_path, "error": error_msg}
 
@@ -717,7 +718,7 @@ async def process_local_image(
         
     except Exception as e:
         error_msg = f"Error processing local image {file_path}: {str(e)}"
-        ctx.error(error_msg)
+        await ctx.error(error_msg)
         logger.exception(error_msg)
         return {"path": file_path, "error": error_msg}
 
@@ -790,7 +791,7 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
                     scale_factor *= 0.8
                     if current_width * scale_factor < 200 or current_height * scale_factor < 200:
                         error_msg = f"Unable to compress large local image {file_path} to acceptable size while maintaining quality"
-                        ctx.error(error_msg)
+                        await ctx.error(error_msg)
                         logger.error(error_msg)
                         return {"path": file_path, "error": error_msg}
                     
@@ -799,12 +800,12 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
     
     except MemoryError as e:
         error_msg = f"Out of memory processing large local image {file_path}: {str(e)}"
-        ctx.error(error_msg)
+        await ctx.error(error_msg)
         logger.error(error_msg)
         return {"path": file_path, "error": error_msg}
     except Exception as e:
         error_msg = f"Error processing large local image {file_path}: {str(e)}"
-        ctx.error(error_msg)
+        await ctx.error(error_msg)
         logger.exception(error_msg)
         return {"path": file_path, "error": error_msg}
     
@@ -826,7 +827,7 @@ async def fetch_single_image(
         parsed = urlparse(url)
         if not all([parsed.scheme in ['http', 'https'], parsed.netloc]):
             error_msg = f"Invalid URL: {url}"
-            ctx.error(error_msg)
+            await ctx.error(error_msg)
             return {"url": url, "error": error_msg}
 
         response = await client.get(url)
@@ -835,7 +836,7 @@ async def fetch_single_image(
         content_type = response.headers.get('content-type', '')
         if not content_type.startswith('image/'):
             error_msg = f"Not an image (got {content_type})"
-            ctx.error(error_msg)
+            await ctx.error(error_msg)
             return {"url": url, "error": error_msg}
 
         logger.debug(f"Fetched image from {url} with {len(response.content)} bytes")
@@ -866,11 +867,11 @@ async def fetch_single_image(
 
     except httpx.HTTPError as e:
         error_msg = f"HTTP error: {str(e)}"
-        ctx.error(error_msg)
+        await ctx.error(error_msg)
         return {"url": url, "error": error_msg}
     except Exception as e:
         error_msg = f"Unexpected error: {str(e)}"
-        ctx.error(error_msg)
+        await ctx.error(error_msg)
         return {"url": url, "error": error_msg}
 
 def is_url(path_or_url: str) -> bool:
@@ -987,7 +988,7 @@ async def fetch_images(
         
         # Validate input
         if not image_sources:
-            ctx.error("No image sources provided")
+            await ctx.error("No image sources provided")
             logger.error("fetch_images called with empty source list")
             return []
 
@@ -995,7 +996,7 @@ async def fetch_images(
             if svg_dpi is None:
                 # 修复 SVG 输入缺少 svg_dpi 时继续带着空值向下游传递的问题。
                 error_message = "svg_dpi is required when image_sources contains SVG files"
-                ctx.error(error_message)
+                await ctx.error(error_message)
                 logger.error(error_message)
                 return [error_message for _ in image_sources]
         else:
@@ -1026,7 +1027,7 @@ async def fetch_images(
                 source = result.get("path") or result.get("url") or "unknown source"
                 error = result.get("error") or "Unknown error"
                 error_message = f"Error processing {source}: {error}"
-                ctx.error(error_message)
+                await ctx.error(error_message)
                 image_results.append(error_message)
         
         elapsed = asyncio.get_event_loop().time() - start_time
@@ -1040,7 +1041,7 @@ async def fetch_images(
         return image_results
     except Exception as e:
         logger.exception("Error in fetch_images")
-        ctx.error(f"Failed to process images: {str(e)}")
+        await ctx.error(f"Failed to process images: {str(e)}")
         return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
 def _获取pymupdf信息() -> Optional[dict]:
@@ -1361,14 +1362,14 @@ async def PDF转图像(
                     图像结果.append(f"处理第{单页页码}页图像失败")
             except Exception as 异常:
                 错误信息 = f"转换第{单页页码}页失败: {str(异常)}"
-                ctx.error(错误信息)
+                await ctx.error(错误信息)
                 logger.exception(错误信息)
                 图像结果.append(错误信息)
 
         return 图像结果
     except Exception as 异常:
         错误信息 = f"PDF 转图像时发生错误: {str(异常)}"
-        ctx.error(错误信息)
+        await ctx.error(错误信息)
         logger.exception(错误信息)
         return [错误信息]
 
@@ -1380,7 +1381,8 @@ def _补丁工具参数名大小写不敏感(工具函数名: str) -> None:
     在校验前将传入参数名按大小写不敏感的方式映射回 Python 函数签名中的原始参数名。
     """
     import types as _types
-    from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata as _FuncMetadata
+    # 修复 mcp 2.0 中 FuncMetadata 移到 mcpserver 子包导致的导入失败。
+    from mcp.server.mcpserver.utilities.func_metadata import FuncMetadata as _FuncMetadata
 
     工具对象 = mcp._tool_manager._tools.get(工具函数名)
     if 工具对象 is None:
@@ -1401,12 +1403,14 @@ def _补丁工具参数名大小写不敏感(工具函数名: str) -> None:
 
     原始方法 = 工具对象.fn_metadata.call_fn_with_arg_validation
 
+    # 修复 mcp 2.0 的 call_fn_with_arg_validation 新增第 5 个可选参数 pre_validated；包装签名须透传。
     async def _大小写不敏感调用(
         self: _FuncMetadata,
         fn,
         fn_is_async,
         arguments_to_validate,
         arguments_to_pass_directly,
+        pre_validated=None,
     ):
         规范化参数 = {}
         for 键, 值 in arguments_to_validate.items():
@@ -1415,7 +1419,7 @@ def _补丁工具参数名大小写不敏感(工具函数名: str) -> None:
                 规范化参数[小写到原始[小写键]] = 值
             else:
                 规范化参数[键] = 值
-        return await 原始方法(fn, fn_is_async, 规范化参数, arguments_to_pass_directly)
+        return await 原始方法(fn, fn_is_async, 规范化参数, arguments_to_pass_directly, pre_validated)
 
     # 修复 Pydantic FuncMetadata 不允许直接设置未注册字段的问题；绕过 Pydantic 的 __setattr__。
     object.__setattr__(工具对象.fn_metadata, "call_fn_with_arg_validation", _types.MethodType(
