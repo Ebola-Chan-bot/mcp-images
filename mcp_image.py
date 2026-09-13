@@ -242,6 +242,121 @@ def _save_processed_image(img: PILImage.Image, has_transparency: bool, quality: 
     return img_byte_arr.getvalue(), "jpeg"
 
 
+def _规范裁剪框(裁剪框: Optional[List[int]], 图像宽度: int, 图像高度: int) -> Optional[tuple]:
+    """校验并规范化裁剪框 [x, y, width, height] 到 (x, y, w, h)。
+
+    超出图像边缘的部分自动裁剪到边界；裁剪框 为 None 时返回 None；框非法（长度不为 4、宽高非正、起点越界）时抛 ValueError。
+    """
+    if 裁剪框 is None:
+        return None
+    if len(裁剪框) != 4:
+        raise ValueError(f"裁剪框 必须是 [x, y, width, height] 四个整数，收到 {裁剪框}")
+    try:
+        x, y, w, h = (int(v) for v in 裁剪框)
+    except (TypeError, ValueError) as 转换异常:
+        raise ValueError(f"裁剪框 必须是四个整数，收到 {裁剪框}") from 转换异常
+    if w <= 0 or h <= 0:
+        raise ValueError(f"裁剪框 的宽高必须为正数，收到 width={w}, height={h}")
+    if x >= 图像宽度 or y >= 图像高度:
+        raise ValueError(f"裁剪框 起点 ({x}, {y}) 超出图像尺寸 {图像宽度}x{图像高度}")
+    x = max(0, x)
+    y = max(0, y)
+    w = min(w, 图像宽度 - x)
+    h = min(h, 图像高度 - y)
+    return (x, y, w, h)
+
+
+def _裁剪图像字节(图像数据: bytes, 裁剪框: List[int], 来源格式: Optional[str] = None) -> tuple:
+    """按归一化后的裁剪框裁剪位图字节流并重新编码。返回 (字节数据, 格式名)。
+
+    超出边缘的部分自动 clamp；非法 裁剪框 抛 ValueError（由调用方转成每源错误）。
+    """
+    with PILImage.open(BytesIO(图像数据)) as 图像:
+        图像.load()
+        宽度, 高度 = 图像.size
+        归一化框 = _规范裁剪框(裁剪框, 宽度, 高度)
+        if 归一化框 is None:
+            return 图像数据, 来源格式
+        # _规范裁剪框返回 (x, y, w, h)，PIL.crop 需要 (left, upper, right, lower)。
+        x, y, w, h = 归一化框
+        PIL裁剪框 = (x, y, x + w, y + h)
+        原始格式 = (图像.format or "png").lower()
+        输出格式 = (来源格式 or 原始格式).lower()
+        if 输出格式.startswith("image/"):
+            输出格式 = 输出格式.split("/")[-1]
+        裁剪后图 = 图像.crop(PIL裁剪框)
+        字节流 = BytesIO()
+        if 输出格式 in ("jpeg", "jpg"):
+            # JPEG 不支持 alpha，裁剪后统一转 RGB。
+            (裁剪后图 if 裁剪后图.mode == "RGB" else 裁剪后图.convert("RGB")).save(
+                字节流, format="JPEG", quality=90, optimize=True)
+            输出格式 = "jpeg"
+        elif 输出格式 == "gif":
+            裁剪后图.save(字节流, format="GIF")
+        elif 输出格式 == "webp":
+            裁剪后图.save(字节流, format="WEBP", quality=90)
+        elif 输出格式 == "bmp":
+            裁剪后图.save(字节流, format="BMP")
+        elif 输出格式 in ("tiff", "tif"):
+            裁剪后图.save(字节流, format="TIFF")
+            输出格式 = "tiff"
+        else:
+            裁剪后图.save(字节流, format="PNG")
+            输出格式 = "png"
+        return 字节流.getvalue(), 输出格式
+
+
+def _浮点转属性字符串(数值: float) -> str:
+    文本 = f"{数值:.4f}".rstrip("0").rstrip(".")
+    return 文本 if 文本 else "0"
+
+
+def _按裁剪框重写SVG(SVG文本: str, 裁剪框: tuple, 完整渲染宽度: int, 完整渲染高度: int) -> Optional[str]:
+    """矢量级裁剪：把根 <svg> 标签的 viewBox 按完整渲染尺寸重映射，并将 width/height 改为裁剪框像素。
+
+    裁剪框 是已规范化的 (x, y, w, h)，坐标属于“按 svg_dpi 渲染完整图像后的像素空间”。重写后渲染器只会以全 DPI 渲染裁剪区域，细节无损。
+    仅在根标签能解析出 viewBox 时生效，否则返回 None（调用方回退到渲染后位图裁剪）。
+    只用正则重写根标签而不用 ElementTree 整树序列化，避免破坏 xlink: 等命名空间前缀。
+    """
+    根标签匹配 = re.search(r"<svg\b[^>]*>", SVG文本)
+    if not 根标签匹配:
+        return None
+    根标签 = 根标签匹配.group(0)
+    if 根标签.endswith("/>"):  # 自闭合根标签不符合 SVG 结构，防御性放弃
+        return None
+    视图框匹配 = re.search(
+        r"""viewBox\s*=\s*["']\s*([-\d.eE+]+)[\s,]+([-\d.eE+]+)[\s,]+([-\d.eE+]+)[\s,]+([-\d.eE+]+)""",
+        根标签,
+    )
+    if not 视图框匹配:
+        return None
+    try:
+        vb_x, vb_y, vb_w, vb_h = (float(g) for g in 视图框匹配.groups())
+    except ValueError:
+        return None
+    if vb_w <= 0 or vb_h <= 0 or 完整渲染宽度 <= 0 or 完整渲染高度 <= 0:
+        return None
+
+    x, y, w, h = 裁剪框
+    横向比例 = vb_w / 完整渲染宽度
+    纵向比例 = vb_h / 完整渲染高度
+    新视图框 = " ".join(
+        _浮点转属性字符串(v)
+        for v in (vb_x + x * 横向比例, vb_y + y * 纵向比例, w * 横向比例, h * 纵向比例)
+    )
+
+    def _替换属性(标签: str, 属性名: str, 属性值: str) -> str:
+        模式 = rf'(\s{属性名}\s*=\s*)(["\'])[^"\']*\2'
+        if re.search(模式, 标签):
+            return re.sub(模式, lambda m: m.group(1) + m.group(2) + 属性值 + m.group(2), 标签, count=1)
+        return 标签[:-1] + f' {属性名}="{属性值}">'
+
+    新标签 = _替换属性(根标签, "viewBox", 新视图框)
+    新标签 = _替换属性(新标签, "width", str(w))
+    新标签 = _替换属性(新标签, "height", str(h))
+    return SVG文本[: 根标签匹配.start()] + 新标签 + SVG文本[根标签匹配.end():]
+
+
 def _解析SVG长度(长度文本: Optional[str], dpi: float) -> Optional[int]:
     if not 长度文本:
         return None
@@ -507,18 +622,36 @@ async def _处理SVG字节(
     svg_dpi: int,
     浏览器路径: Optional[str] = None,
     表情字体路径: Optional[str] = None,
+    裁剪框: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     try:
         svg_dpi = max(50, min(svg_dpi, 1200))
         logger.debug("检测到 SVG 图片: %s，按 %s DPI 通过 CDP 渲染", image_source, svg_dpi)
+        渲染数据 = svg_data
+        渲染后裁剪框 = 裁剪框
+        if 裁剪框 is not None:
+            # 裁剪框坐标属于“按 svg_dpi 渲染完整 SVG 后的像素空间”，与 _获取SVG目标尺寸一致。
+            完整宽度, 完整高度 = _获取SVG目标尺寸(svg_data, svg_dpi)
+            归一化框 = _规范裁剪框(裁剪框, 完整宽度, 完整高度)
+            重写后SVG = _按裁剪框重写SVG(
+                svg_data.decode("utf-8", errors="replace"), 归一化框, 完整宽度, 完整高度
+            )
+            if 重写后SVG is not None:
+                # 矢量级裁剪：渲染器以全 DPI 只渲染裁剪区域，细节无损。
+                渲染数据 = 重写后SVG.encode("utf-8")
+                渲染后裁剪框 = None
+                logger.debug("SVG 矢量级裁剪: box=%s，完整渲染尺寸 %dx%d", 归一化框, 完整宽度, 完整高度)
+            else:
+                # 无 viewBox 等情形回退：先渲染完整图，再做位图裁剪。
+                logger.debug("SVG 缺少 viewBox，回退到渲染后位图裁剪: box=%s", 归一化框)
         png_data = await asyncio.to_thread(
             通过CDP渲染SVG到PNG,
-            svg_data,
+            渲染数据,
             svg_dpi,
             浏览器路径,
             表情字体路径,
         )
-        处理后图片 = await process_image_data(png_data, "png", image_source, ctx)
+        处理后图片 = await process_image_data(png_data, "png", image_source, ctx, 裁剪框=渲染后裁剪框)
         if 处理后图片 is None:
             return {"error": "处理 SVG 图片失败"}
         return {"image": 处理后图片}
@@ -532,9 +665,24 @@ async def _处理SVG字节(
 # Create an MCP server instance（mcp 2.0 中 FastMCP 已更名为 MCPServer）
 mcp = MCPServer("image-service")
 
-async def process_image_data(data: bytes, content_type: str, image_source: str, ctx: Context) -> Image | None:
+async def process_image_data(
+    data: bytes,
+    content_type: str,
+    image_source: str,
+    ctx: Context,
+    裁剪框: Optional[List[int]] = None,
+) -> Image | None:
     """Process image data and return an MCP Image object."""
     try:
+        if 裁剪框 is not None:
+            try:
+                # 先裁剪再进入压缩管线，避免裁剪区域被大图降质/缩放二次损伤。
+                data, content_type = _裁剪图像字节(data, 裁剪框, content_type)
+            except ValueError as 裁剪异常:
+                # 非法裁剪框需把具体原因作为错误信息返回给对应源，不能被下面的通用 except 吞成 "Failed to process image"。
+                raise ValueError(f"图像源 {image_source} 的裁剪框无效: {裁剪异常}")
+            logger.debug(f"Cropped {image_source} with 裁剪框={裁剪框} -> {len(data)} bytes")
+
         # If image is not large, try to log dimensions without processing
         if len(data) <= 1048576:
             try:
@@ -637,6 +785,9 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
             if os.path.exists(temp_path):
                 os.remove(temp_path)
                 
+    except ValueError:
+        # 非法裁剪框：重新抛出让 process_local_image/fetch_single_image 的每源错误分支携带具体原因。
+        raise
     except Exception as e:
         await ctx.error(f"Error processing image: {str(e)}")
         logger.exception(f"Unexpected error processing {image_source}")
@@ -648,6 +799,7 @@ async def process_local_image(
     svg_dpi: int = 150,
     浏览器路径: Optional[str] = None,
     表情字体路径: Optional[str] = None,
+    裁剪框: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Processes a local image file and returns a dictionary with the result."""
     try:
@@ -673,6 +825,7 @@ async def process_local_image(
                     svg_dpi,
                     浏览器路径=浏览器路径,
                     表情字体路径=表情字体路径,
+                    裁剪框=裁剪框,
                 )
                 SVG处理结果["path"] = file_path
                 return SVG处理结果
@@ -702,14 +855,14 @@ async def process_local_image(
         if file_size > 1048576:
             logger.debug(f"Large local image detected: {file_path} ({file_size} bytes)")
             # Process the image directly using the same logic as for URL images
-            return await process_large_local_image(file_path, content_type, ctx)
+            return await process_large_local_image(file_path, content_type, ctx, 裁剪框=裁剪框)
         
         # For smaller files, read the entire content
         with open(file_path, "rb") as f:
             file_data = f.read()
         
         logger.debug(f"Read local image from {file_path} with {len(file_data)} bytes")
-        processed_image = await process_image_data(file_data, content_type, file_path, ctx)
+        processed_image = await process_image_data(file_data, content_type, file_path, ctx, 裁剪框=裁剪框)
         
         if processed_image is None:
             return {"path": file_path, "error": "Failed to process image"}
@@ -722,7 +875,12 @@ async def process_local_image(
         logger.exception(error_msg)
         return {"path": file_path, "error": error_msg}
 
-async def process_large_local_image(file_path: str, content_type: str, ctx: Context) -> Dict[str, Any]:
+async def process_large_local_image(
+    file_path: str,
+    content_type: str,
+    ctx: Context,
+    裁剪框: Optional[List[int]] = None,
+) -> Dict[str, Any]:
     """Process a large local image file directly without loading it entirely into memory."""
     temp_path = None
     try:
@@ -737,6 +895,9 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
             has_transparency = _image_has_transparency(img)
             logger.debug(f"Original large local image dimensions from {file_path}: {orig_width}x{orig_height}")
             logger.debug(f"Original image format: {orig_format}, mode: {orig_mode}")
+
+        # 裁剪框基于原图完整尺寸校验；后续 initial_scale/压缩都作用在已裁剪的图上。
+        归一化裁剪框 = _规范裁剪框(裁剪框, orig_width, orig_height)
         
         # Calculate optimal resize factor if image is very large
         max_dimension = max(orig_width, orig_height)
@@ -750,10 +911,16 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
             if not has_transparency and img.mode in ('RGBA', 'P'):
                 img = img.convert('RGB')
             
+            # 先裁剪再缩放，避免大图先被 initial_scale 缩小导致裁剪区域细节丢失。
+            if 归一化裁剪框 is not None:
+                x, y, w, h = 归一化裁剪框
+                img = img.crop((x, y, x + w, y + h))
+                logger.debug(f"Cropped large local image {file_path} with 裁剪框={裁剪框} -> {img.size}")
+            
             # Apply initial scale if needed
             if initial_scale < 1.0:
-                width = int(orig_width * initial_scale)
-                height = int(orig_height * initial_scale)
+                width = int(img.size[0] * initial_scale)
+                height = int(img.size[1] * initial_scale)
                 img = img.resize((width, height), PILImage.LANCZOS)
             else:
                 width, height = img.size
@@ -821,6 +988,7 @@ async def fetch_single_image(
     svg_dpi: int = 150,
     浏览器路径: Optional[str] = None,
     表情字体路径: Optional[str] = None,
+    裁剪框: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Fetches and processes a single image asynchronously."""
     try:
@@ -850,6 +1018,7 @@ async def fetch_single_image(
                 svg_dpi,
                 浏览器路径=浏览器路径,
                 表情字体路径=表情字体路径,
+                裁剪框=裁剪框,
             )
             SVG处理结果["url"] = url
             return SVG处理结果
@@ -858,7 +1027,7 @@ async def fetch_single_image(
         format_type = content_type.split('/')[-1]
         logger.debug(f"Extracted format type: {format_type}")
         
-        processed_image = await process_image_data(response.content, format_type, url, ctx)
+        processed_image = await process_image_data(response.content, format_type, url, ctx, 裁剪框=裁剪框)
         
         if processed_image is None:
             return {"url": url, "error": "Failed to process image"}
@@ -894,6 +1063,7 @@ async def process_images_async(
     svg_dpi: int = 150,
     浏览器路径: Optional[str] = None,
     表情字体路径: Optional[str] = None,
+    裁剪框: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Process multiple images (URLs or local files) concurrently."""
     if not image_sources:
@@ -917,6 +1087,7 @@ async def process_images_async(
                     svg_dpi=svg_dpi,
                     浏览器路径=浏览器路径,
                     表情字体路径=表情字体路径,
+                    裁剪框=裁剪框,
                 )
                 for url in urls
             ]
@@ -933,6 +1104,7 @@ async def process_images_async(
                 svg_dpi=svg_dpi,
                 浏览器路径=浏览器路径,
                 表情字体路径=表情字体路径,
+                裁剪框=裁剪框,
             )
             for path in local_paths
         ]
@@ -961,6 +1133,7 @@ async def fetch_images(
     svg_dpi: Optional[int] = None,
     浏览器路径: Optional[str] = None,
     表情字体路径: Optional[str] = None,
+    裁剪框: Optional[List[int]] = None,
 ):
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
@@ -978,6 +1151,7 @@ async def fetch_images(
         svg_dpi: Required only when image_sources contains SVG files. Higher values produce clearer images but larger files.
         浏览器路径: 可选。单次调用覆盖默认浏览器路径。
         表情字体路径: 可选。单次调用覆盖默认 emoji 字体路径。
+        裁剪框: 可选，[x, y, width, height] 四个整数（像素），只返回该裁剪方框内的图像部分，对列表中所有图像源生效。坐标空间为完整解码后图像的像素空间：位图即解码后的图像像素；SVG 则是按 svg_dpi 渲染完整图像后的像素空间（例如 300 DPI 下 SVG 物理宽度 10㎜ 约对应 118 像素）。超出图像边缘的部分会自动裁剪到边缘；宽或高 ≤ 0、起点 (x, y) 超出图像范围时，对应源返回错误字符串。SVG 优先采用矢量级裁剪（重写 viewBox，只渲染裁剪区域），细节无损。
         
     Returns:
         A list in the same order as the input sources.
@@ -1014,6 +1188,7 @@ async def fetch_images(
             svg_dpi=svg_dpi,
             浏览器路径=浏览器路径,
             表情字体路径=表情字体路径,
+            裁剪框=裁剪框,
         )
         
         # Extract Image objects, or explicit error messages for failures

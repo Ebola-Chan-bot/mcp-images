@@ -43,19 +43,19 @@ pip install --user uv
 然后直接启动服务：
 
 ```bash
-uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.1 mcp-image-server
+uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.2.0 mcp-image-server
 ```
 
 如果你要确保服务使用指定浏览器或指定 emoji 字体，可以在启动时显式传入参数：
 
 ```bash
-uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.1 mcp-image-server --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --表情字体路径 "C:\Windows\Fonts\seguiemj.ttf"
+uvx --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.2.0 mcp-image-server --浏览器路径 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --表情字体路径 "C:\Windows\Fonts\seguiemj.ttf"
 ```
 
 如果你希望把命令安装到本机，也可以使用：
 
 ```bash
-uv tool install --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.1 mcp-image-server
+uv tool install --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.2.0 mcp-image-server
 ```
 
 安装后可直接运行：
@@ -64,7 +64,7 @@ uv tool install --from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.1 m
 mcp-image-server
 ```
 
-升级到新版本时，把命令中的 `@v1.1.1` 替换成新的发布 tag 即可。
+升级到新版本时，把命令中的 `@v1.2.0` 替换成新的发布 tag 即可。
 
 本地开发或调试时，才需要在仓库目录中直接运行源码。
 
@@ -102,7 +102,7 @@ mcp-image-server
   "servers": {
     "image-service": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.1", "mcp-image-server"]
+      "args": ["--from", "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.2.0", "mcp-image-server"]
     }
   },
   "inputs": []
@@ -118,7 +118,7 @@ mcp-image-server
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.1",
+        "git+https://github.com/Ebola-Chan-bot/mcp-images@v1.2.0",
         "mcp-image-server",
         "--浏览器路径",
         "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
@@ -136,7 +136,7 @@ mcp-image-server
 其他 MCP 客户端可参考以下原则配置：
 
 - `command` 使用 `uvx`
-- `args` 使用 `--from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.1.1 mcp-image-server`
+- `args` 使用 `--from git+https://github.com/Ebola-Chan-bot/mcp-images@v1.2.0 mcp-image-server`
 - 如果需要，再额外追加 `--浏览器路径` 和 `--表情字体路径`
 
 ## 可用工具
@@ -151,6 +151,7 @@ mcp-image-server
 - `svg_dpi`：当 `image_sources` 中包含 SVG 时必填。控制 SVG 转 PNG 时的渲染 DPI
 - `浏览器路径`：可选。单次调用覆盖服务默认浏览器路径
 - `表情字体路径`：可选。单次调用覆盖服务默认 emoji 字体路径
+- `裁剪框`：可选，`[x, y, width, height]` 四个整数（像素），只返回裁剪方框内的图像部分，对列表中所有图像源生效。坐标空间为完整解码后图像的像素空间：位图即解码后的图像像素；SVG 则是按 `svg_dpi` 渲染完整图像后的像素空间。超出图像边缘的部分自动裁剪到边缘；宽或高 ≤ 0、起点超出图像范围时，对应源返回错误字符串。SVG 优先采用矢量级裁剪（重写 viewBox 后只渲染裁剪区域），细节无损
 
 返回值：
 
