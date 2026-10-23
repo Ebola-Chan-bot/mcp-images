@@ -1428,19 +1428,14 @@ def _pdf单页转图像(
             文档.close()
 
 
-def _pdf全部页转图像(
-    PDF路径: str,
-    输出格式: str = "png",
-    DPI: int = 150,
-) -> List[Dict[str, Any]]:
-    """将 PDF 的全部页面渲染为图像列表。
+def _pdf获取总页数(PDF路径: str) -> int:
+    """只读取 PDF 总页数，不渲染任何页面。
 
     参数:
         PDF路径: PDF 文件的绝对路径。
-        输出格式: 输出图像格式。
 
     返回:
-        列表，每项包含 "页码" 和 "图像字节"。
+        PDF 的总页数。
     """
     if not os.path.isfile(PDF路径):
         raise FileNotFoundError(f"PDF 文件不存在: {PDF路径}")
@@ -1449,19 +1444,7 @@ def _pdf全部页转图像(
     文档 = None
     try:
         文档 = fitz.open(PDF路径)
-        总页数 = 文档.page_count
-        结果列表: List[Dict[str, Any]] = []
-
-        for 索引 in range(总页数):
-            页面 = 文档[索引]
-            像素图 = 页面.get_pixmap(dpi=DPI)
-            if 输出格式 == "jpeg":
-                图像字节 = 像素图.tobytes("jpeg")
-            else:
-                图像字节 = 像素图.tobytes("png")
-            结果列表.append({"页码": 索引 + 1, "图像字节": 图像字节})
-
-        return 结果列表
+        return int(文档.page_count)
     finally:
         if 文档 is not None:
             文档.close()
@@ -1478,19 +1461,20 @@ async def PDF转图像(
     将 PDF 文件的指定页面转换为图像，返回给智能体。
 
     本工具支持将 PDF 文档的一页或多页渲染为 PNG 图像。
-    如果不指定页码范围，则默认转换全部页面。
-    渲染使用 150 DPI，在清晰度与文件大小之间取得平衡。
+    如果不指定页码范围，则不渲染任何页面，仅返回 PDF 的总页数。
+    渲染默认使用 150 DPI，在清晰度与文件大小之间取得平衡。
 
     参数:
         PDF文件路径: PDF 文件的绝对路径（如 "C:/文档/报告.pdf"）。
         页码: 可选，需要转换的页码列表，页码从 1 开始计数。
               例如 [1, 3, 5] 将转换第 1、3、5 页。
-              如果不指定此参数，则转换 PDF 的全部页面。
+              如果不指定此参数，则不渲染任何页面，仅返回总页数提示（用于先摸清页数再按需取页）。
         DPI: 可选，渲染分辨率，默认 150。更高值图像更清晰但文件更大。
 
     返回:
-        图像列表，顺序与请求的页码一致。
+        指定页码时：图像列表，顺序与请求的页码一致，
         每个元素为一个 Image 对象（成功时）或错误描述字符串（失败时）。
+        未指定页码时：一段说明 PDF 总页数的文字，不包含任何图像。
     """
     try:
         # 修复 PDF 路径为空时下游报错不明确的问题。
@@ -1503,27 +1487,25 @@ async def PDF转图像(
         # 修复 subprocess.call 在 async 上下文中阻塞事件循环的问题；将安装放到线程池执行。
         await asyncio.to_thread(_ensure_pymupdf)
 
+        # 未指定页码时不再渲染任何页面，只返回总页数，避免整本 PDF 被一次性灌进上下文。
+        if 页码 is None:
+            # 与 _ensure_pymupdf 同样放线程池执行，避免 fitz.open 阻塞事件循环。
+            总页数 = await asyncio.to_thread(_pdf获取总页数, PDF文件路径)
+            logger.debug(f"未指定页码，不渲染页面，仅返回总页数 {总页数}: {PDF文件路径}")
+            if 总页数 <= 0:
+                return f"该 PDF 不含任何页面: {PDF文件路径}"
+            # 示例页码按实际页数生成，避免给 1 页 PDF 提示 [1, 2, 3] 这类越界示例。
+            示例页码 = list(range(1, min(3, 总页数) + 1))
+            return (
+                f"未指定页码，本次未渲染任何页面。该 PDF 共 {总页数} 页（有效页码范围 1-{总页数}）。"
+                f"请通过 页码 参数指定需要转换的页面，例如 {示例页码}。"
+            )
+
         输出格式 = "png"
         实际DPI = 150 if DPI is None else max(50, min(DPI, 1200))
 
-        # 如果未指定页码，则转换全部页面
-        if 页码 is None:
-            logger.debug(f"未指定页码，将转换 PDF 全部页面: {PDF文件路径}")
-            全部结果 = _pdf全部页转图像(PDF文件路径, 输出格式, 实际DPI)
-            图像结果: List[Any] = []
-            for 条目 in 全部结果:
-                处理后图像 = await process_image_data(
-                    条目["图像字节"], 输出格式,
-                    f"{PDF文件路径} 第{条目['页码']}页", ctx
-                )
-                if 处理后图像 is not None:
-                    图像结果.append(处理后图像)
-                else:
-                    图像结果.append(f"处理第{条目['页码']}页图像失败")
-            return 图像结果
-
         # 转换指定页面
-        图像结果 = []
+        图像结果: List[Any] = []
         for 单页页码 in 页码:
             try:
                 图像字节 = _pdf单页转图像(PDF文件路径, 单页页码, 输出格式, 实际DPI)
