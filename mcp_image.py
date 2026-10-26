@@ -1312,9 +1312,10 @@ def _下载wheel(url: str, 目标路径: str, 总大小: int) -> bool:
 def _安装本地wheel(wheel路径: str) -> bool:
     """直接将 wheel 解压到 site-packages，绕过 pip/uv 子进程避免卡死。"""
     import zipfile as _zipfile
-    import site as _site
+    import sysconfig as _sysconfig
 
-    _目标目录 = _site.getsitepackages()[0] if _site.getsitepackages() else os.path.join(sys.prefix, "Lib", "site-packages")
+    # 修复 Windows uv 环境中 getsitepackages()[0] 指向环境根目录，导致 wheel 解压后仍无法导入的问题。
+    _目标目录 = _sysconfig.get_path("purelib")
     logger.info("正在安装 PyMuPDF 到 %s...", _目标目录)
     for _h in logger.handlers:
         _h.flush()
@@ -1338,6 +1339,58 @@ def _安装本地wheel(wheel路径: str) -> bool:
         return False
 
 
+def _通过包管理器安装pymupdf(优先备用镜像: bool = False) -> None:
+    """通过 uv 或 pip 将 PyMuPDF 安装到当前解释器环境。"""
+    import subprocess as _subprocess
+
+    _依赖 = "pymupdf>=1.24.0"
+    # 修复 uv/uvx 环境没有 pip 导致回退失败，以及 uv 未指定目标解释器的问题。
+    if shutil.which("uv"):
+        _安装器 = "uv"
+        _安装命令 = ["uv", "pip", "install", "--python", sys.executable]
+        _索引环境变量 = ("UV_DEFAULT_INDEX", "UV_INDEX_URL", "PIP_INDEX_URL")
+    elif importlib.util.find_spec("pip") is not None:
+        _安装器 = "pip"
+        _安装命令 = [sys.executable, "-m", "pip", "install"]
+        _索引环境变量 = ("PIP_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX_URL")
+    else:
+        raise RuntimeError("无法自动安装 PyMuPDF：当前环境没有 pip，且 PATH 中未找到 uv。")
+
+    _配置索引 = next(
+        (os.environ[名称] for 名称 in _索引环境变量 if os.environ.get(名称)),
+        None,
+    )
+    _备用索引 = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    if _配置索引:
+        _索引列表 = [_配置索引]
+    elif 优先备用镜像:
+        _索引列表 = [_备用索引, None]
+    else:
+        _索引列表 = [None, _备用索引]
+
+    _返回码 = 1
+    _命令 = [*_安装命令, _依赖]
+    for _索引 in _索引列表:
+        _命令 = [*_安装命令]
+        if _索引:
+            _命令.extend(["--index-url", _索引])
+        _命令.append(_依赖)
+
+        if _配置索引:
+            _来源 = "自定义软件源"
+        elif _索引 is None:
+            _来源 = "默认软件源"
+        else:
+            _来源 = "备用镜像"
+        logger.info("使用 %s（%s）安装 PyMuPDF...", _安装器, _来源)
+        _返回码 = _subprocess.call(_命令)
+        if _返回码 == 0:
+            return
+        logger.warning("%s 安装 PyMuPDF 失败，退出码 %d", _安装器, _返回码)
+
+    raise _subprocess.CalledProcessError(_返回码, _命令)
+
+
 def _ensure_pymupdf():
     """修复 pymupdf（约 70 MB）作为必装依赖导致初始安装过大的问题；改为首次调用 PDF 功能时按需安装。"""
     global fitz
@@ -1352,7 +1405,6 @@ def _ensure_pymupdf():
         for _h in logger.handlers:
             _h.flush()
 
-        import subprocess as _subprocess
         _成功 = False
 
         # 策略1：自己下载 wheel 后直接解压安装（最快、可控进度、不怕子进程卡死）
@@ -1368,14 +1420,10 @@ def _ensure_pymupdf():
                 except Exception:
                     pass
 
-        # 策略2：让 pip/uv 自己下载安装（回退）
+        # 策略2：让 uv/pip 自己下载安装（回退）
         if not _成功:
-            logger.info("改用 pip 安装 PyMuPDF...")
-            _返回码 = _subprocess.call([sys.executable, "-m", "pip", "install", "pymupdf>=1.24.0"])
-            if _返回码 != 0:
-                _返回码 = _subprocess.call(["uv", "pip", "install", "pymupdf>=1.24.0"])
-                if _返回码 != 0:
-                    raise _subprocess.CalledProcessError(_返回码, ["uv", "pip", "install", "pymupdf>=1.24.0"])
+            # 修复 PyPI 不可达时仍重复请求默认源的问题；元数据请求已失败则优先使用备用镜像。
+            _通过包管理器安装pymupdf(优先备用镜像=_信息 is None)
 
         import fitz
         logger.info("PyMuPDF 安装完成，继续处理 PDF")
