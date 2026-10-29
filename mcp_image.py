@@ -18,6 +18,7 @@ import httpx
 import logging
 from io import BytesIO
 from datetime import datetime
+from contextlib import contextmanager
 from PIL import Image as PILImage
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1219,48 +1220,251 @@ async def fetch_images(
         await ctx.error(f"Failed to process images: {str(e)}")
         return [f"Failed to process source: {src}. Error: {str(e)}" for src in image_sources]
 
-def _获取pymupdf信息() -> Optional[dict]:
-    """查询 PyPI 获取适配当前平台的 pymupdf wheel 的 URL、大小和文件名。"""
-    import json as _json
+# 多源竞速下载用的镜像源（实测 simple 索引与官方同步到 2.0）。按名称+根地址列出；各源并发查询、并发下载，首个完成的胜出，其余立即强制中止。
+_PyMuPDF下载源: List[tuple] = [
+    ("PyPI 官方", "https://pypi.org"),
+    ("阿里云", "https://mirrors.aliyun.com/pypi"),
+    ("中科大", "https://mirrors.ustc.edu.cn/pypi"),
+    ("腾讯云", "https://mirrors.cloud.tencent.com/pypi"),
+    ("华为云", "https://repo.huaweicloud.com/repository/pypi"),
+    ("清华", "https://pypi.tuna.tsinghua.edu.cn"),
+]
+
+
+def _平台wheel标签() -> List[str]:
+    """返回适配当前平台的 wheel platform_tag 候选列表（按优先级）。"""
     import platform as _platform
-    from urllib.request import urlopen as _urlopen
+    机器 = _platform.machine().lower()
+    if sys.platform == "win32":
+        return ["win_amd64", "win32"] if 机器 in ("amd64", "x86_64") else ["win32"]
+    if sys.platform == "darwin":
+        return ["macosx_11_0_arm64", "macosx_10_9_x86_64"] if 机器 == "arm64" else ["macosx_10_9_x86_64"]
+    return ["manylinux_2_28_x86_64", "musllinux_1_2_x86_64", "manylinux_2_28_aarch64"]
 
-    _机器 = _platform.machine().lower()
-    _系统 = sys.platform
 
-    # 根据当前平台构建候选 platform_tag 列表，按优先级排序
-    if _系统 == "win32":
-        _候选标签 = ["win_amd64", "win32"] if _机器 in ("amd64", "x86_64") else ["win32"]
-    elif _系统 == "darwin":
-        _候选标签 = ["macosx_11_0_arm64", "macosx_10_9_x86_64"] if _机器 == "arm64" else ["macosx_10_9_x86_64"]
-    else:
-        _候选标签 = ["manylinux_2_28_x86_64", "musllinux_1_2_x86_64", "manylinux_2_28_aarch64"]
+def _从文件列表选wheel(文件列表: List[dict]) -> Optional[dict]:
+    """在 PyPI JSON 的 urls 列表里选出适配平台的 wheel，返回 {url,size,filename}。"""
+    for 标签 in _平台wheel标签():
+        for f in 文件列表:
+            if f.get("packagetype") == "bdist_wheel" and 标签 in f.get("filename", ""):
+                if f.get("size", 0) > 0 and f.get("url"):
+                    return {"url": f["url"], "size": f["size"], "filename": f["filename"]}
+    for f in 文件列表:
+        if f.get("packagetype") == "bdist_wheel" and f.get("size", 0) > 0 and f.get("url"):
+            return {"url": f["url"], "size": f["size"], "filename": f["filename"]}
+    return None
+
+
+def _查询单源wheel信息(源名: str, 根地址: str, 超时秒: float = 8) -> Optional[dict]:
+    """查询单个源的适配 wheel 信息。优先 JSON 接口，失败则解析 simple 索引。
+
+    返回 {源名, url, size, filename}；size 未知时为 0（竞速按下载完成判胜，不依赖预知大小）。
+    """
+    import json as _json
+    import re as _re
+    from urllib.parse import urljoin as _urljoin
+    from urllib.request import Request as _Request, urlopen as _urlopen
+
+    UA = {"User-Agent": "pip/24.0"}
+
+    # 1) JSON 接口（含确切 size）
+    try:
+        with _urlopen(_Request(f"{根地址}/pypi/pymupdf/json", headers=UA), timeout=超时秒) as resp:
+            数据 = _json.loads(resp.read().decode())
+        选中 = _从文件列表选wheel(数据.get("urls", []) or 数据.get("info", {}).get("urls", []))
+        if 选中:
+            选中["源名"] = 源名
+            return 选中
+    except Exception:
+        pass
+
+    # 2) simple 索引（只有文件名，无 size）
+    try:
+        simple地址 = f"{根地址}/simple/pymupdf/"
+        with _urlopen(_Request(simple地址, headers=UA), timeout=超时秒) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        链接们 = _re.findall(r'href="([^"]+)"', html)
+        for 标签 in _平台wheel标签():
+            匹配 = [u for u in 链接们 if u.split("#")[0].endswith(".whl") and 标签 in u]
+            if 匹配:
+                # 取列表最后一个（simple 索引按版本升序，末尾即最新）
+                链接 = 匹配[-1].split("#")[0]
+                文件名 = 链接.rsplit("/", 1)[-1]
+                return {"源名": 源名, "url": _urljoin(simple地址, 链接), "size": 0, "filename": 文件名}
+    except Exception:
+        pass
+    return None
+
+
+def _单源下载进程入口(信息: dict, 目录: str, 结果队列) -> None:
+    """子进程入口：只负责下载一个源，完成后向队列报告。
+
+    刻意做成模块级顶层函数，保证 Windows spawn 子进程能 pickle 启动。
+    子进程只依赖标准库，不 import 整个 mcp_image，冷启动快。
+    """
+    try:
+        import httpx as _httpx
+    except ImportError:
+        _httpx = None
+
+    源名 = 信息["源名"]
+    目标路径 = os.path.join(目录, 信息["filename"])
+    try:
+        if _httpx is not None:
+            with _httpx.Client(follow_redirects=True, timeout=_httpx.Timeout(None, connect=20)) as client:
+                with client.stream("GET", 信息["url"]) as resp:
+                    resp.raise_for_status()
+                    with open(目标路径, "wb") as f:
+                        for 块 in resp.iter_bytes(chunk_size=262144):
+                            f.write(块)
+        else:
+            # httpx 不可用时回退 urllib
+            from urllib.request import Request as _Request, urlopen as _urlopen
+            with _urlopen(_Request(信息["url"], headers={"User-Agent": "pip/24.0"}), timeout=30) as resp:
+                with open(目标路径, "wb") as f:
+                    while True:
+                        块 = resp.read(262144)
+                        if not 块:
+                            break
+                        f.write(块)
+        大小 = os.path.getsize(目标路径)
+        # 只有完整写完才上报“完成”。主进程收到此消息即认定该源胜出。
+        结果队列.put({"源名": 源名, "path": 目标路径, "size": 大小, "完成": True})
+    except Exception:
+        # 失败/被中止：尽力清理半成品，并上报失败让主进程计数。
+        try:
+            if os.path.isfile(目标路径):
+                os.remove(目标路径)
+        except Exception:
+            pass
+        try:
+            结果队列.put({"源名": 源名, "完成": False})
+        except Exception:
+            pass
+
+
+def _竞速下载wheel(目录: str, 源列表: Optional[List[tuple]] = None,
+                   总超时秒: float = 300) -> Optional[dict]:
+    """多源进程级竞速下载 wheel。首个完整下载完成的源胜出，其余进程立即被 terminate。返回 {源名, path, size} 或 None（全部失败）。
+
+    为什么用进程而不是线程：Windows 上无法可靠强杀阻塞在 socket 读的线程，而 Process.terminate() 就是 TerminateProcess，无论子进程卡在网络读、DNS还是任何 C 层阻塞，都能立刻结束，不会留下杀不掉的悬挂任务。
+
+    中止语义：只有已经产生胜者之后才 terminate 其余进程；只要还没有任何源下载完成，就继续等待，绝不提前杀掉仍在正常下载的进程。总超时秒 是最后兜底。
+    """
+    import multiprocessing as _mp
+
+    源列表 = 源列表 or _PyMuPDF下载源
+
+    # 1) 并行查询各源元数据（这步仍是轻量 HTTP，用线程池即可，不涉及强杀需求）
+    import concurrent.futures as _futures
+    信息列表: List[dict] = []
+    with _futures.ThreadPoolExecutor(max_workers=len(源列表)) as 池:
+        未来表 = {池.submit(_查询单源wheel信息, 名, 根): 名 for 名, 根 in 源列表}
+        for 未来 in _futures.as_completed(未来表):
+            try:
+                信息 = 未来.result()
+            except Exception:
+                信息 = None
+            if 信息:
+                信息列表.append(信息)
+
+    if not 信息列表:
+        logger.warning("所有源均未能获取 PyMuPDF 下载信息")
+        return None
+
+    logger.info("开始多源竞速下载 PyMuPDF（每源一进程），源: %s", "、".join(i["源名"] for i in 信息列表))
+
+    # 2) 每个源起一个独立进程下载到共享目录。
+    #    spawn 上下文：Windows 默认即 spawn；子进程入口是顶层函数可 pickle。
+    上下文 = _mp.get_context("spawn")
+    结果队列 = 上下文.Queue()
+    进程表 = {}  # Process -> 源名
+    for 信息 in 信息列表:
+        p = 上下文.Process(target=_单源下载进程入口, args=(信息, 目录, 结果队列), daemon=True)
+        p.start()
+        进程表[p] = 信息["源名"]
+
+    胜出: Optional[dict] = None
+    失败数 = 0
+    开始时间 = time.time()
 
     try:
-        with _urlopen("https://pypi.org/pypi/pymupdf/json", timeout=5) as _resp:
-            _data = _json.loads(_resp.read().decode())
-        _files = _data.get("urls", []) or _data.get("info", {}).get("urls", [])
+        # 没产生胜者且还有进程在跑，就继续等队列消息。
+        while 胜出 is None and 失败数 < len(进程表):
+            剩余 = 总超时秒 - (time.time() - 开始时间)
+            if 剩余 <= 0:
+                logger.warning("等待胜源超时（%s 秒），仍有源未完成", 总超时秒)
+                break
+            try:
+                消息 = 结果队列.get(timeout=min(剩余, 1.0))
+            except Exception:
+                # 每秒醒一次，顺便检查是否所有进程都已退出却无结果（异常兜底）。
+                if not any(p.is_alive() for p in 进程表):
+                    break
+                continue
 
-        for _标签 in _候选标签:
-            for _f in _files:
-                if _f.get("packagetype") == "bdist_wheel" and _标签 in _f.get("filename", ""):
-                    _size = _f.get("size", 0)
-                    _url = _f.get("url", "")
-                    _filename = _f.get("filename", "")
-                    if _size > 0 and _url:
-                        return {"url": _url, "size": _size, "filename": _filename}
+            if 消息.get("完成"):
+                # 首个上报完成的源即胜者。文件已完整落在共享目录，主进程直接用。
+                胜出 = {"源名": 消息["源名"], "path": 消息["path"], "size": 消息["size"]}
+                logger.info("源 %s 下载完成，判定为胜源，正在 terminate 其余进程...", 消息["源名"])
+                break
+            else:
+                失败数 += 1
+    finally:
+        # 收尾：无论胜/负/超时，终止所有非胜源进程。有胜者时只杀其它进程；无胜者时全部杀掉，绝不留悬挂下载进程。
+        for p, 名 in 进程表.items():
+            if 胜出 is not None and 名 == 胜出["源名"]:
+                continue
+            if p.is_alive():
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        # 给胜源一个正常退出的机会；其它进程 join 确保被回收。
+        for p, 名 in 进程表.items():
+            try:
+                p.join(timeout=3 if (胜出 and 名 == 胜出["源名"]) else 1)
+            except Exception:
+                pass
+        try:
+            结果队列.close()
+            结果队列.join_thread()
+        except Exception:
+            pass
 
-        # 无精确匹配时取任意 wheel（回退用，安装可能失败但由 pip 兜底）
-        for _f in _files:
-            if _f.get("packagetype") == "bdist_wheel":
-                _size = _f.get("size", 0)
-                _url = _f.get("url", "")
-                _filename = _f.get("filename", "")
-                if _size > 0 and _url:
-                    return {"url": _url, "size": _size, "filename": _filename}
-        return None
+        # 修复被 terminate 的子进程来不及清理自己半成品文件的问题：主进程统一删除非胜源落盘的文件，避免在共享目录留下垃圾。
+        for 信息 in 信息列表:
+            if 胜出 is not None and 信息["源名"] == 胜出["源名"]:
+                continue
+            try:
+                半成品 = os.path.join(目录, 信息["filename"])
+                if os.path.isfile(半成品):
+                    os.remove(半成品)
+            except Exception:
+                pass
+
+    if 胜出 is not None:
+        return 胜出
+
+    # 全部失败：清掉共享目录里可能的半成品文件。
+    try:
+        for 名 in os.listdir(目录):
+            try:
+                os.remove(os.path.join(目录, 名))
+            except Exception:
+                pass
     except Exception:
-        return None
+        pass
+    return None
+
+    # 全部失败：清掉可能存在的半成品文件，避免污染。
+    for t in 任务们:
+        try:
+            if t.目标路径 and os.path.isfile(t.目标路径):
+                os.remove(t.目标路径)
+        except Exception:
+            pass
+    return None
 
 
 def _格式化大小(字节数: int) -> str:
@@ -1271,46 +1475,86 @@ def _格式化大小(字节数: int) -> str:
     return f"{字节数} B"
 
 
-def _下载wheel(url: str, 目标路径: str, 总大小: int) -> bool:
-    """用 httpx 流式下载 wheel，实时报告已下载/总大小/速度。返回是否成功。"""
-    try:
-        import httpx as _httpx
-        _开始时间 = time.time()
-        _已下载 = 0
-        _上次报告时间 = 0.0
+# ---- PyMuPDF 按需安装的并发控制 ----
+# 进程内锁：串行化同一进程里的并发首次调用。
+_pymupdf线程锁 = threading.Lock()
+# 就绪标志：装好后本进程后续调用直接返回，不再重复 import 检查。
+_pymupdf就绪 = False
+# 全局 fitz 模块引用：_pdf单页转图像/_pdf获取总页数 里的 fitz.open 依赖它。
+fitz = None
 
-        with _httpx.Client(follow_redirects=True, timeout=_httpx.Timeout(600, connect=30)) as _client:
-            with _client.stream("GET", url) as _resp:
-                _resp.raise_for_status()
-                with open(目标路径, "wb") as _f:
-                    for _块 in _resp.iter_bytes(chunk_size=8192):
-                        _f.write(_块)
-                        _已下载 += len(_块)
-                        _现在 = time.time()
-                        # 每 5 秒报告一次进度
-                        if _现在 - _上次报告时间 >= 5:
-                            _耗时 = _现在 - _开始时间
-                            _速度 = _已下载 / _耗时 if _耗时 > 0 else 0
-                            _百分比 = _已下载 / 总大小 * 100 if 总大小 > 0 else 0
-                            logger.info(
-                                "下载 PyMuPDF: %s / %s (%.0f%%)，速度 %s/s",
-                                _格式化大小(_已下载), _格式化大小(总大小), _百分比, _格式化大小(int(_速度)),
-                            )
-                            for _h in logger.handlers:
-                                _h.flush()
-                            _上次报告时间 = _现在
 
-        _总耗时 = time.time() - _开始时间
-        _平均速度 = _已下载 / _总耗时 if _总耗时 > 0 else 0
-        logger.info("PyMuPDF 下载完成: %s，耗时 %.0f 秒，平均速度 %s/s", _格式化大小(_已下载), _总耗时, _格式化大小(int(_平均速度)))
-        return True
-    except Exception:
-        logger.exception("下载 PyMuPDF wheel 失败")
-        return False
+def _标记pymupdf就绪() -> None:
+    """标记 PyMuPDF 就绪，并把 fitz 模块绑定到全局供 fitz.open 使用。
+
+    修复重写 _ensure_pymupdf 时删去 global fitz 后，_pdf单页转图像/_pdf获取总页数 中 fitz.open 报 NameError 的问题。
+    """
+    global _pymupdf就绪, fitz
+    import fitz as _fitz模块
+    fitz = _fitz模块
+    _pymupdf就绪 = True
+
+
+@contextmanager
+def _持有pymupdf安装锁(超时秒: float = 900.0):
+    """跨进程互斥安装 PyMuPDF。
+
+    锁文件放在系统临时目录（tempfile.gettempdir()），不能用 TEMP_DIR：uvx运行时 TEMP_DIR 位于 uv 缓存快照内，快照重建后路径改变，锁会失效。持锁进程崩溃时操作系统会随文件句柄关闭自动释放锁，不会死锁。超时仅作兜底，避免异常情况下调用方无限等待。
+    """
+    锁目录 = tempfile.gettempdir()
+    os.makedirs(锁目录, exist_ok=True)
+    锁路径 = os.path.join(锁目录, "mcp-image-pymupdf-install.lock")
+
+    with open(锁路径, "a+b") as 锁文件:
+        # msvcrt.locking 需要文件至少有 1 字节才能锁住该区域。
+        锁文件.seek(0, os.SEEK_END)
+        if 锁文件.tell() == 0:
+            锁文件.write(b"0")
+            锁文件.flush()
+        锁文件.seek(0)
+
+        开始时间 = time.time()
+        首次等待 = True
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt as _msvcrt
+                    _msvcrt.locking(锁文件.fileno(), _msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl as _fcntl
+                    _fcntl.flock(锁文件.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() - 开始时间 > 超时秒:
+                    raise TimeoutError(
+                        f"等待 PyMuPDF 安装锁超时（{超时秒} 秒）: {锁路径}。"
+                        "可能有其它进程正在安装，或上次安装异常中断。"
+                    )
+                if 首次等待:
+                    logger.info("另一进程正在安装 PyMuPDF，等待其完成后复用...")
+                    首次等待 = False
+                time.sleep(0.5)
+
+        try:
+            yield
+        finally:
+            try:
+                锁文件.seek(0)
+                if sys.platform == "win32":
+                    import msvcrt as _msvcrt
+                    _msvcrt.locking(锁文件.fileno(), _msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl as _fcntl
+                    _fcntl.flock(锁文件.fileno(), _fcntl.LOCK_UN)
+            except OSError:
+                pass
 
 
 def _安装本地wheel(wheel路径: str) -> bool:
-    """直接将 wheel 解压到 site-packages，绕过 pip/uv 子进程避免卡死。"""
+    """直接将 wheel 解压到 site-packages，绕过 pip/uv 子进程避免卡死。
+
+    调用方须已持有 PyMuPDF 安装锁（见 _ensure_pymupdf）：解压不是原子操作，靠锁保证不会有其它进程同时读写同一批文件。
+    """
     import zipfile as _zipfile
     import sysconfig as _sysconfig
 
@@ -1339,94 +1583,66 @@ def _安装本地wheel(wheel路径: str) -> bool:
         return False
 
 
-def _通过包管理器安装pymupdf(优先备用镜像: bool = False) -> None:
-    """通过 uv 或 pip 将 PyMuPDF 安装到当前解释器环境。"""
-    import subprocess as _subprocess
-
-    _依赖 = "pymupdf>=1.24.0"
-    # 修复 uv/uvx 环境没有 pip 导致回退失败，以及 uv 未指定目标解释器的问题。
-    if shutil.which("uv"):
-        _安装器 = "uv"
-        _安装命令 = ["uv", "pip", "install", "--python", sys.executable]
-        _索引环境变量 = ("UV_DEFAULT_INDEX", "UV_INDEX_URL", "PIP_INDEX_URL")
-    elif importlib.util.find_spec("pip") is not None:
-        _安装器 = "pip"
-        _安装命令 = [sys.executable, "-m", "pip", "install"]
-        _索引环境变量 = ("PIP_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX_URL")
-    else:
-        raise RuntimeError("无法自动安装 PyMuPDF：当前环境没有 pip，且 PATH 中未找到 uv。")
-
-    _配置索引 = next(
-        (os.environ[名称] for 名称 in _索引环境变量 if os.environ.get(名称)),
-        None,
-    )
-    _备用索引 = "https://pypi.tuna.tsinghua.edu.cn/simple"
-    if _配置索引:
-        _索引列表 = [_配置索引]
-    elif 优先备用镜像:
-        _索引列表 = [_备用索引, None]
-    else:
-        _索引列表 = [None, _备用索引]
-
-    _返回码 = 1
-    _命令 = [*_安装命令, _依赖]
-    for _索引 in _索引列表:
-        _命令 = [*_安装命令]
-        if _索引:
-            _命令.extend(["--index-url", _索引])
-        _命令.append(_依赖)
-
-        if _配置索引:
-            _来源 = "自定义软件源"
-        elif _索引 is None:
-            _来源 = "默认软件源"
-        else:
-            _来源 = "备用镜像"
-        logger.info("使用 %s（%s）安装 PyMuPDF...", _安装器, _来源)
-        _返回码 = _subprocess.call(_命令)
-        if _返回码 == 0:
-            return
-        logger.warning("%s 安装 PyMuPDF 失败，退出码 %d", _安装器, _返回码)
-
-    raise _subprocess.CalledProcessError(_返回码, _命令)
-
-
 def _ensure_pymupdf():
-    """修复 pymupdf（约 70 MB）作为必装依赖导致初始安装过大的问题；改为首次调用 PDF 功能时按需安装。"""
-    global fitz
-    try:
-        import fitz
-    except ImportError:
-        _信息 = _获取pymupdf信息()
-        if _信息:
-            logger.info("首次使用 PDF 功能，正在安装 PyMuPDF（%s）...", _格式化大小(_信息["size"]))
-        else:
-            logger.info("首次使用 PDF 功能，正在安装 PyMuPDF...")
-        for _h in logger.handlers:
-            _h.flush()
+    """修复 pymupdf（约 70 MB）作为必装依赖导致初始安装过大的问题；改为首次调用 PDF 功能时按需安装。
 
-        _成功 = False
+    并发安全（修复并发首次调用导致重复下载、wheel 互相覆盖的问题）：
+    - 进程内用 threading.Lock 串行化；
+    - 跨进程用系统临时目录下的文件锁互斥（uvx 下 TEMP_DIR 随缓存快照变化，不能用作锁位置）；
+    - 拿到锁后再次尝试 import：若另一进程/线程已装好，直接返回，不重复下载；
+    - 下载与解压都在锁内完成。
+    """
+    # 进程内快速路径：已就绪则连锁都不用拿。
+    if _pymupdf就绪:
+        return
 
-        # 策略1：自己下载 wheel 后直接解压安装（最快、可控进度、不怕子进程卡死）
-        if _信息:
-            _wheel路径 = os.path.join(TEMP_DIR, _信息["filename"])
+    with _pymupdf线程锁:
+        if _pymupdf就绪:
+            return
+        try:
+            import fitz  # noqa: F401
+            _标记pymupdf就绪()
+            return
+        except ImportError:
+            pass
+
+        # 跨进程锁：同一台机器上多个 MCP 服务器进程可能同时首次调用 PDF。锁内会再次 import 检查，因此拿到锁时发现已被别的进程装好就直接返回。
+        with _持有pymupdf安装锁():
             try:
-                if _下载wheel(_信息["url"], _wheel路径, _信息["size"]):
-                    if _安装本地wheel(_wheel路径):
+                import fitz  # noqa: F401
+                _标记pymupdf就绪()
+                logger.debug("PyMuPDF 已由其它进程安装完成，直接复用")
+                return
+            except ImportError:
+                pass
+
+            _成功 = False
+
+            # 多源并行竞速下载 wheel 后解压安装。竞速函数内部并行查询各源元数据并下载，首个完成者胜出、其余立即强制中止；不再保留 uv/pip 回退安装策略。
+            with tempfile.TemporaryDirectory(prefix="pymupdf-wheel-") as _下载目录:
+                _胜出 = _竞速下载wheel(_下载目录)
+                if _胜出:
+                    logger.info("使用源 %s 的 wheel（%s）进行安装", _胜出["源名"], _格式化大小(_胜出["size"]))
+                    if _安装本地wheel(_胜出["path"]):
                         _成功 = True
-            finally:
-                try:
-                    os.remove(_wheel路径)
-                except Exception:
-                    pass
 
-        # 策略2：让 uv/pip 自己下载安装（回退）
-        if not _成功:
-            # 修复 PyPI 不可达时仍重复请求默认源的问题；元数据请求已失败则优先使用备用镜像。
-            _通过包管理器安装pymupdf(优先备用镜像=_信息 is None)
+            if not _成功:
+                raise RuntimeError(
+                    "多源竞速下载 PyMuPDF 均失败或解压安装失败。请检查网络是否能访问任一 PyPI 镜像源，或手动 pip install pymupdf 后重试。"
+                )
 
-        import fitz
-        logger.info("PyMuPDF 安装完成，继续处理 PDF")
+            try:
+                import fitz  # noqa: F401
+            except ImportError as 导入异常:
+                # 装完仍无法导入时给出环境信息，便于定位“装到了别的环境”这类问题。
+                import sysconfig as _sysconfig
+                raise ImportError(
+                    "PyMuPDF 安装后仍无法导入 fitz。"
+                    f"当前解释器: {sys.executable}；purelib: {_sysconfig.get_path('purelib')}。"
+                    "可能是安装目标环境与运行环境不一致。"
+                ) from 导入异常
+            _标记pymupdf就绪()
+            logger.info("PyMuPDF 安装完成，继续处理 PDF")
 
 
 def _pdf单页转图像(
