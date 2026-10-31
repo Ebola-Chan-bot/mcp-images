@@ -1296,20 +1296,29 @@ def _查询单源wheel信息(源名: str, 根地址: str, 超时秒: float = 8) 
     return None
 
 
-def _单源下载进程入口(信息: dict, 目录: str, 结果队列) -> None:
-    """子进程入口：只负责下载一个源，完成后向队列报告。
+def _单源下载进程入口(源名: str, 根地址: str, 子目录: str, 目录: str, 结果队列) -> None:
+    """子进程入口：独立完成「查元数据 → 下载」全流程，从元数据阶段就参与竞速。刻意做成模块级顶层函数，保证 Windows spawn 子进程能 pickle 启动。子进程只依赖标准库（httpx 可选），不 import 整个 mcp_image，冷启动快。
 
-    刻意做成模块级顶层函数，保证 Windows spawn 子进程能 pickle 启动。
-    子进程只依赖标准库，不 import 整个 mcp_image，冷启动快。
+    设计要点：元数据查询不再集中在主进程串行等待，而是下放到每个子进程，
+    使不同源从第一步（查元数据）就开始并行竞速；最快的源（元数据快+下载快）率先完成即胜出，慢源/超时源来不及拖慢整体。不同源下载的 wheel 往往同名，故每个源写入自己独立的子目录，避免同名覆盖，也避免主进程清理非胜源时误删胜源文件。
     """
     try:
         import httpx as _httpx
     except ImportError:
         _httpx = None
 
-    源名 = 信息["源名"]
-    目标路径 = os.path.join(目录, 信息["filename"])
     try:
+        # 第一步：查本源的元数据（JSON 优先，失败回退 simple 索引）。
+        信息 = _查询单源wheel信息(源名, 根地址)
+        if not 信息:
+            结果队列.put({"源名": 源名, "完成": False, "阶段": "元数据"})
+            return
+
+        本源目录 = os.path.join(目录, 子目录)
+        os.makedirs(本源目录, exist_ok=True)
+        目标路径 = os.path.join(本源目录, 信息["filename"])
+
+        # 第二步：下载 wheel。
         if _httpx is not None:
             with _httpx.Client(follow_redirects=True, timeout=_httpx.Timeout(None, connect=20)) as client:
                 with client.stream("GET", 信息["url"]) as resp:
@@ -1318,7 +1327,6 @@ def _单源下载进程入口(信息: dict, 目录: str, 结果队列) -> None:
                         for 块 in resp.iter_bytes(chunk_size=262144):
                             f.write(块)
         else:
-            # httpx 不可用时回退 urllib
             from urllib.request import Request as _Request, urlopen as _urlopen
             with _urlopen(_Request(信息["url"], headers={"User-Agent": "pip/24.0"}), timeout=30) as resp:
                 with open(目标路径, "wb") as f:
@@ -1347,7 +1355,7 @@ def _竞速下载wheel(目录: str, 源列表: Optional[List[tuple]] = None,
                    总超时秒: float = 300) -> Optional[dict]:
     """多源进程级竞速下载 wheel。首个完整下载完成的源胜出，其余进程立即被 terminate。返回 {源名, path, size} 或 None（全部失败）。
 
-    为什么用进程而不是线程：Windows 上无法可靠强杀阻塞在 socket 读的线程，而 Process.terminate() 就是 TerminateProcess，无论子进程卡在网络读、DNS还是任何 C 层阻塞，都能立刻结束，不会留下杀不掉的悬挂任务。
+    为什么用进程而不是线程：Windows 上无法可靠强杀阻塞在 socket 读的线程，而 Process.terminate() 就是 TerminateProcess，无论子进程卡在网络读、DNS还是任何 C 层阻塞，都能立刻结束，不会留下杀不掉的悬挂任务。竞速从元数据阶段就开始：每个子进程独立完成「查元数据→下载」全流程，主进程一开始就把所有源的进程同时撒出去，不做集中的元数据查询等待。
 
     中止语义：只有已经产生胜者之后才 terminate 其余进程；只要还没有任何源下载完成，就继续等待，绝不提前杀掉仍在正常下载的进程。总超时秒 是最后兜底。
     """
@@ -1355,34 +1363,18 @@ def _竞速下载wheel(目录: str, 源列表: Optional[List[tuple]] = None,
 
     源列表 = 源列表 or _PyMuPDF下载源
 
-    # 1) 并行查询各源元数据（这步仍是轻量 HTTP，用线程池即可，不涉及强杀需求）
-    import concurrent.futures as _futures
-    信息列表: List[dict] = []
-    with _futures.ThreadPoolExecutor(max_workers=len(源列表)) as 池:
-        未来表 = {池.submit(_查询单源wheel信息, 名, 根): 名 for 名, 根 in 源列表}
-        for 未来 in _futures.as_completed(未来表):
-            try:
-                信息 = 未来.result()
-            except Exception:
-                信息 = None
-            if 信息:
-                信息列表.append(信息)
+    logger.info("开始多源竞速下载 PyMuPDF（每源一进程，含元数据查询），源: %s", "、".join(名 for 名, _ in 源列表))
 
-    if not 信息列表:
-        logger.warning("所有源均未能获取 PyMuPDF 下载信息")
-        return None
-
-    logger.info("开始多源竞速下载 PyMuPDF（每源一进程），源: %s", "、".join(i["源名"] for i in 信息列表))
-
-    # 2) 每个源起一个独立进程下载到共享目录。
-    #    spawn 上下文：Windows 默认即 spawn；子进程入口是顶层函数可 pickle。
+    # 直接为每个源起一个独立进程，子进程内部自行查元数据并下载到独立子目录。
+    # spawn 上下文：Windows 默认即 spawn；子进程入口是顶层函数可 pickle。
     上下文 = _mp.get_context("spawn")
     结果队列 = 上下文.Queue()
-    进程表 = {}  # Process -> 源名
-    for 信息 in 信息列表:
-        p = 上下文.Process(target=_单源下载进程入口, args=(信息, 目录, 结果队列), daemon=True)
+    进程表 = {}  # Process -> (源名, 子目录)
+    for 序号, (源名, 根地址) in enumerate(源列表):
+        子目录 = f"src{序号}"
+        p = 上下文.Process(target=_单源下载进程入口, args=(源名, 根地址, 子目录, 目录, 结果队列), daemon=True)
         p.start()
-        进程表[p] = 信息["源名"]
+        进程表[p] = (源名, 子目录)
 
     胜出: Optional[dict] = None
     失败数 = 0
@@ -1404,7 +1396,7 @@ def _竞速下载wheel(目录: str, 源列表: Optional[List[tuple]] = None,
                 continue
 
             if 消息.get("完成"):
-                # 首个上报完成的源即胜者。文件已完整落在共享目录，主进程直接用。
+                # 首个上报完成的源即胜者。文件已完整落在独立子目录，主进程直接用。
                 胜出 = {"源名": 消息["源名"], "path": 消息["path"], "size": 消息["size"]}
                 logger.info("源 %s 下载完成，判定为胜源，正在 terminate 其余进程...", 消息["源名"])
                 break
@@ -1412,7 +1404,7 @@ def _竞速下载wheel(目录: str, 源列表: Optional[List[tuple]] = None,
                 失败数 += 1
     finally:
         # 收尾：无论胜/负/超时，终止所有非胜源进程。有胜者时只杀其它进程；无胜者时全部杀掉，绝不留悬挂下载进程。
-        for p, 名 in 进程表.items():
+        for p, (名, _子目录) in 进程表.items():
             if 胜出 is not None and 名 == 胜出["源名"]:
                 continue
             if p.is_alive():
@@ -1421,7 +1413,7 @@ def _竞速下载wheel(目录: str, 源列表: Optional[List[tuple]] = None,
                 except Exception:
                     pass
         # 给胜源一个正常退出的机会；其它进程 join 确保被回收。
-        for p, 名 in 进程表.items():
+        for p, (名, _子目录) in 进程表.items():
             try:
                 p.join(timeout=3 if (胜出 and 名 == 胜出["源名"]) else 1)
             except Exception:
@@ -1432,14 +1424,12 @@ def _竞速下载wheel(目录: str, 源列表: Optional[List[tuple]] = None,
         except Exception:
             pass
 
-        # 修复被 terminate 的子进程来不及清理自己半成品文件的问题：主进程统一删除非胜源落盘的文件，避免在共享目录留下垃圾。
-        for 信息 in 信息列表:
-            if 胜出 is not None and 信息["源名"] == 胜出["源名"]:
+        # 修复被 terminate 的子进程来不及清理自己半成品文件的问题：主进程统一删除非胜源的整个子目录。各源写独立子目录，删非胜源不会误伤胜源文件。
+        for p, (名, 子目录) in 进程表.items():
+            if 胜出 is not None and 名 == 胜出["源名"]:
                 continue
             try:
-                半成品 = os.path.join(目录, 信息["filename"])
-                if os.path.isfile(半成品):
-                    os.remove(半成品)
+                shutil.rmtree(os.path.join(目录, 子目录), ignore_errors=True)
             except Exception:
                 pass
 
@@ -1449,21 +1439,16 @@ def _竞速下载wheel(目录: str, 源列表: Optional[List[tuple]] = None,
     # 全部失败：清掉共享目录里可能的半成品文件。
     try:
         for 名 in os.listdir(目录):
-            try:
-                os.remove(os.path.join(目录, 名))
-            except Exception:
-                pass
+            路径 = os.path.join(目录, 名)
+            if os.path.isdir(路径):
+                shutil.rmtree(路径, ignore_errors=True)
+            else:
+                try:
+                    os.remove(路径)
+                except Exception:
+                    pass
     except Exception:
         pass
-    return None
-
-    # 全部失败：清掉可能存在的半成品文件，避免污染。
-    for t in 任务们:
-        try:
-            if t.目标路径 and os.path.isfile(t.目标路径):
-                os.remove(t.目标路径)
-        except Exception:
-            pass
     return None
 
 
@@ -1550,16 +1535,50 @@ def _持有pymupdf安装锁(超时秒: float = 900.0):
                 pass
 
 
+def _选择pymupdf安装目录() -> str:
+    """选择可写的安装目录。
+
+    修复在 Microsoft Store 版 Python 等场景下 purelib 指向受保护系统目录、解压安装报 PermissionError [WinError 5] 拒绝访问 的问题：优先用 purelib（uvx 临时环境可写、且与运行环境一致）；若不可写，回退到用户级 site-packages（pip --user 的安装位置，无需管理员权限）。
+    """
+    import site as _site
+    import sysconfig as _sysconfig
+
+    候选 = []
+    try:
+        候选.append(_sysconfig.get_path("purelib"))
+    except Exception:
+        pass
+    try:
+        候选.append(_site.getusersitepackages())
+    except Exception:
+        pass
+
+    for 目录 in 候选:
+        if not 目录:
+            continue
+        try:
+            os.makedirs(目录, exist_ok=True)
+            # 实际写一个临时文件验证可写（仅判断目录存在不可靠）
+            探针 = os.path.join(目录, f".mcp-write-test-{os.getpid()}")
+            with open(探针, "w") as f:
+                f.write("")
+            os.remove(探针)
+            return 目录
+        except Exception:
+            continue
+
+    # 都不可写时退回 purelib，让后续报错信息指向它。
+    return _sysconfig.get_path("purelib")
+
+
 def _安装本地wheel(wheel路径: str) -> bool:
-    """直接将 wheel 解压到 site-packages，绕过 pip/uv 子进程避免卡死。
+    """直接将 wheel 解压到可写的 site-packages，绕过 pip/uv 子进程避免卡死。
 
     调用方须已持有 PyMuPDF 安装锁（见 _ensure_pymupdf）：解压不是原子操作，靠锁保证不会有其它进程同时读写同一批文件。
     """
     import zipfile as _zipfile
-    import sysconfig as _sysconfig
 
-    # 修复 Windows uv 环境中 getsitepackages()[0] 指向环境根目录，导致 wheel 解压后仍无法导入的问题。
-    _目标目录 = _sysconfig.get_path("purelib")
+    _目标目录 = _选择pymupdf安装目录()
     logger.info("正在安装 PyMuPDF 到 %s...", _目标目录)
     for _h in logger.handlers:
         _h.flush()
