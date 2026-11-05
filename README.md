@@ -27,17 +27,17 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - Reads JPEG, PNG, GIF, WebP, BMP, TIFF, ICO, PPM, TGA and AVIF; returns JPEG, PNG, GIF and WebP as-is when they are small enough and converts the rest to PNG or JPEG. Other formats are refused (EPS, for instance, would run Ghostscript)
 - Downscales to 1568px on the longer edge; all images in one call share a ~700 KB budget (about 930 KB once base64-encoded), under the ~1 MB tool-result limit Claude Desktop is reported to enforce
 - Always preserves alpha channels: oversized transparent PNGs are scaled down instead of being flattened onto white or converted to JPEG; EXIF rotation and cropping in full-display coordinates are also supported
-- Optional SVG support: small icons are rendered large enough to read, custom DPI and vector cropping are available, and an SVG cannot pull in other local files or URLs
+- Optional SVG support: a headless Chromium browser renders small icons large enough to read, with custom DPI and vector cropping; SVGs cannot pull in other local files or URLs
 - PDF rendering: query only the page count or render pages in a specified order; PyMuPDF is installed on first use through a multi-source download race
 - Processes up to 20 sources per call in parallel; a failed source returns a message saying why, in its position in the list
 
 ## Prerequisites
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) (recommended)
-- For SVG support only: the native Cairo library
-  - Debian/Ubuntu: `sudo apt install libcairo2`
-  - macOS: `brew install cairo` (on Apple Silicon, also set `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` for the server)
-  - Windows: install the [GTK3 runtime](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer). Its default folder (`C:\Program Files\GTK3-Runtime Win64\bin`) is found automatically; for another location, or another app that bundles `libcairo-2.dll`, set `CAIROCFFI_DLL_DIRECTORIES` to that folder
+- For SVG support only: an Edge, Chrome, or Chromium browser
+  - Standard installation locations on Windows, macOS, and Linux are detected automatically
+  - For a custom browser location, set `MCP_IMAGE_BROWSER_PATH` to the browser executable
+  - The browser runs headlessly with an isolated temporary profile and is stopped after each render
 
 ## Installation
 ```bash
@@ -78,7 +78,7 @@ Inside the container, local paths refer to the mounted folder, e.g. `/images/pho
 The tool can read any file the server process can read and fetch any URL it can reach, including hosts on your local network. Running it in Docker with read-only mounts limits it to the folders you choose.
 
 ## Client Configuration
-Replace `/path/to/mcp-images` with where you cloned the repository. Drop `"--extra", "svg"` if you did not install Cairo.
+Replace `/path/to/mcp-images` with where you cloned the repository. Drop `"--extra", "svg"` if you do not have a Chromium browser installed.
 
 #### Claude Code
 This repository ships a `.mcp.json`, so Claude Code sessions opened in it pick the server up automatically. To add it to another project:
@@ -157,7 +157,7 @@ Optional environment variables:
 | `MCP_IMAGE_MAX_TOTAL_BYTES` | `700000` | Size budget shared by all images in one call, before base64 encoding |
 | `MCP_IMAGE_LOG_LEVEL` | `INFO` | Level of the logs written to stderr (`DEBUG` for details) |
 | `MCP_IMAGE_LOG_DIR` | unset | Folder for a detailed debug log file; no file is written when unset |
-| `CAIROCFFI_DLL_DIRECTORIES` | GTK3 runtime folder, if installed | Windows only, read by cairocffi: folders (separated by `;`) containing `libcairo-2.dll` |
+| `MCP_IMAGE_BROWSER_PATH` | Auto-detected Edge, Chrome, or Chromium | Optional path to the Chromium executable used for SVG rendering |
 
 ## Testing and Debugging
 Run the test suite:

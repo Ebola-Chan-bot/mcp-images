@@ -80,12 +80,8 @@ SVG_ROOT = re.compile(rb"\s*<(?:[\w.-]+:)?svg[\s/>]", re.IGNORECASE)
 SVG_RENDERER = Path(__file__).with_name("mcp_image_svg.py")
 SVG_RENDER_TIMEOUT = 10.0
 MAX_SVG_BYTES = 10_000_000
-SVG_NOT_INSTALLED = "SVG support is not installed: install the `mcp-image[svg]` extra and the Cairo library"
+SVG_NOT_INSTALLED = "SVG support requires the `mcp-image[svg]` extra and an Edge, Chrome, or Chromium browser"
 NO_CONSOLE_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-WINDOWS_GTK3_DIR = r"C:\Program Files\GTK3-Runtime Win64\bin"
-if sys.platform == "win32" and not os.environ.get("CAIROCFFI_DLL_DIRECTORIES") and os.path.isdir(WINDOWS_GTK3_DIR):
-    # Read by cairocffi in the SVG renderer process, which inherits this environment.
-    os.environ["CAIROCFFI_DLL_DIRECTORIES"] = WINDOWS_GTK3_DIR
 
 
 def setup_logging() -> logging.Logger:
@@ -204,13 +200,13 @@ def render_svg(
     crop_box: list[int] | None = None,
     emoji_font_path: str | None = None,
 ) -> bytes:
-    """Rasterize an SVG to PNG, with its longer edge near SVG_TARGET_DIMENSION, in a time-limited process."""
-    if find_spec("cairosvg") is None:
+    """Rasterize an SVG to PNG through headless Chromium, with its longer edge near SVG_TARGET_DIMENSION."""
+    if find_spec("websocket") is None:
         raise ImageSourceError(SVG_NOT_INSTALLED)
     if data.startswith(b"\x1f\x8b"):
         data = gunzip(data, MAX_SVG_BYTES)
         if data.startswith(b"\x1f\x8b"):
-            # cairosvg would inflate a second layer without any limit.
+            # Prevent a second compression layer from bypassing the decompressed-size limit.
             raise ImageSourceError("SVG is compressed more than once")
     if len(data) > MAX_SVG_BYTES:
         raise ImageSourceError(f"SVG is larger than {MAX_SVG_BYTES / 1_000_000:g} MB")
@@ -223,6 +219,7 @@ def render_svg(
         str(svg_dpi or ""),
         json.dumps(crop_box) if crop_box is not None else "",
         str(Path(emoji_font_path).expanduser()) if emoji_font_path else "",
+        os.environ.get("MCP_IMAGE_BROWSER_PATH", ""),
     ]
     try:
         result = subprocess.run(
